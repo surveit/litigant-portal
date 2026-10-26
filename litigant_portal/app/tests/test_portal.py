@@ -19,6 +19,7 @@ from django.test import (
 from litigant_portal.app.context_processors import toast_messages
 
 User = get_user_model()
+CHAT_APP_NAME = "chatApp"
 
 
 class DjangoSystemTests(SimpleTestCase):
@@ -36,11 +37,6 @@ class DjangoSystemTests(SimpleTestCase):
 # =============================================================================
 # Route Tests
 # =============================================================================
-
-
-# Shared by both route tests, so renaming the component fails the chat page
-# test instead of leaving the home page check passing vacuously.
-CHAT_APP_NAME = "chatApp"
 
 
 @pytest.mark.postgres
