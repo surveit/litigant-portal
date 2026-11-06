@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import re
 from pathlib import Path
 from typing import Annotated, Literal
@@ -8,7 +7,6 @@ from urllib.parse import urlsplit
 
 import yaml
 from django.conf import settings
-from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from pydantic import (
     BaseModel,
@@ -20,7 +18,6 @@ from pydantic import (
 )
 from pypdf import PdfReader
 
-from litigant_portal.app.cache import CORPUS_TOPIC_KEYS_CACHE_KEY
 from litigant_portal.app.models.choices import (
     ContactKind,
     JurisdictionLevel,
@@ -440,10 +437,14 @@ class SectionSchema(SourceSchema):
 
 class InterviewPageSchema(BaseSchema):
     """Populates a ``TopicFlowInterviewPage`` row and its
-    ``TopicFlowInterviewVariable`` rows."""
+    ``TopicFlowInterviewVariable`` rows.
+
+    ``on_page`` marks a page the guided page asks. The chat and the
+    docassemble handoff use every page, marked or not."""
 
     title: str = Field(min_length=1)
     description: str = ""
+    on_page: bool = False
     variables: list[VariableNameField] = Field(min_length=1)
 
 
@@ -529,6 +530,29 @@ class FlowSchema(BaseSchema):
         """The authored layout, or the default when none is authored."""
         return list(self.layout) or default_layout(s.id for s in self.sections)
 
+    def unasked_decision_variables(self, variables) -> list[str]:
+        """The variables the page reacts to (deadline sources, packet
+        conditions, the gates of the variables it asks) that no page marked
+        ``on_page`` asks, sorted. ``variables`` is the glossary, which
+        holds the gates. Only the chat can set them, which ``corpus.W001``
+        warns about. The same set ``rows.flow_variable_names`` reads."""
+        asked = {
+            name
+            for page in self.interview
+            if page.on_page
+            for name in page.variables
+        }
+        decided = (
+            {deadline.offset_from for deadline in self.deadlines}
+            | {entry.when.variable for entry in self.packet if entry.when}
+            | {
+                variables[name].asked_when.variable
+                for name in asked
+                if name in variables and variables[name].asked_when
+            }
+        )
+        return sorted(decided - asked)
+
     @model_validator(mode="after")
     def _unique_source_ids(self):
         """Validates:
@@ -556,8 +580,9 @@ class FlowSchema(BaseSchema):
         - every name is a section id or a block name
         - every section id appears exactly once
         - every block name appears at most once
-        - a block the flow has content for (interview pages, packet
+        - a block the flow has content for (pages marked on_page, packet
           entries, deadlines) appears, or that content never renders
+        - a placed interview block has at least one page marked on_page
         """
         if not self.layout:
             return self
@@ -574,8 +599,9 @@ class FlowSchema(BaseSchema):
         missing = sorted(section_ids - set(self.layout))
         if missing:
             raise ValueError(f"layout is missing sections: {missing}")
+        marked_pages = [page for page in self.interview if page.on_page]
         filled = {
-            "interview": self.interview,
+            "interview": marked_pages,
             "packet": self.packet,
             "calendar": self.deadlines,
         }
@@ -587,6 +613,10 @@ class FlowSchema(BaseSchema):
         if unplaced:
             raise ValueError(
                 f"layout is missing blocks with content: {unplaced}"
+            )
+        if "interview" in self.layout and not marked_pages:
+            raise ValueError(
+                "layout places interview but no page is marked on_page"
             )
         return self
 
@@ -948,38 +978,6 @@ def corpus_load_topics() -> dict[tuple[str, str], TopicSchema]:
         (path.parts[-4], path.parts[-2]): corpus_parse_yaml(path, TopicSchema)
         for path in sorted(COURTS_DIR.glob("*/topics/*/topic.yml"))
     }
-
-
-def _corpus_topic_tree_fingerprint() -> str:
-    """A hash of the topic document paths on this process's disk. The
-    cached topic index carries it, so a process never serves a list built
-    from another release's tree (an old pod refilling the key after the
-    bust on deploy, for example)."""
-    paths = sorted(
-        str(p.relative_to(COURTS_DIR))
-        for p in COURTS_DIR.glob("*/topics/*/topic.yml")
-    )
-    return hashlib.sha256("\n".join(paths).encode()).hexdigest()
-
-
-def corpus_court_known(court: str, topic: str) -> bool:
-    """Whether a page URL's court is one this deployment serves: the
-    ``CORPUS_COURT`` setting when set (as ``agent_scope_choices`` reads
-    it), otherwise any court authoring ``topic`` in the corpus. The topic
-    index is served from cache, as every rows-path request reads it; a
-    cached index from a different tree counts as a miss."""
-    if settings.CORPUS_COURT is not None:
-        return court == settings.CORPUS_COURT
-    fingerprint = _corpus_topic_tree_fingerprint()
-    cached = cache.get(CORPUS_TOPIC_KEYS_CACHE_KEY)
-    if isinstance(cached, tuple) and cached[0] == fingerprint:
-        keys = cached[1]
-    else:
-        keys = list(corpus_load_topics())
-        cache.set(
-            CORPUS_TOPIC_KEYS_CACHE_KEY, (fingerprint, keys), timeout=None
-        )
-    return (court, topic) in keys
 
 
 def corpus_load_flows() -> dict[tuple[str, str, str], FlowSchema]:

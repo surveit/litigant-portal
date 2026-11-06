@@ -43,7 +43,9 @@ dependencies = [
     "gunicorn>=23.0",
     "heroicons>=2.0",
     # AI Chat — 1.98 adds the bedrock_mantle/* model ids
-    "litellm>=1.98",
+    "litellm[mcp]>=1.98",
+    "boto3>=1.43.41",
+    "openai>=2.24.0",
     "pydantic>=2.10.0",
     # Topic Flow corpus loading (litigant_portal/app/topic_flow)
     "pyyaml>=6.0",
@@ -88,7 +90,7 @@ test = [
 manage = "litigant_portal.manage:main"
 
 [tool.setuptools.packages.find]
-include = [ "litigant_portal*", "lp_agent*" ]
+include = [ "litigant_portal*" ]
 
 
 [tool.setuptools.package-data]
@@ -97,17 +99,10 @@ litigant_portal = [
   "app/static/**/*",
   "app/locale/**/*.po",
   "app/locale/**/*.mo",
-  "content/**/*.yml",
-  "content/**/*.yaml",
   "corpus/**/*.yml",
   "corpus/**/*.pdf",
   "corpus/courts/*/branding/*.svg",
   "corpus/courts/*/branding/*.png",
-]
-lp_agent = [
-  "py.typed",
-  "README.md",
-  "pytest.ini"
 ]
 
 [tool.ruff]
@@ -154,14 +149,14 @@ DJANGO_SETTINGS_MODULE = "litigant_portal.settings"
 python_files = ["tests.py", "test_*.py"]
 python_classes = ["*Tests"]
 pythonpath = ["."]
-testpaths = ["litigant_portal", "lp_agent/tests"]
+testpaths = ["litigant_portal"]
 addopts = "-ra --strict-markers"
 markers = [
     "postgres: test requires a PostgreSQL database",
 ]
 
 [tool.coverage.run]
-source = ["litigant_portal", "lp_agent"]
+source = ["litigant_portal"]
 omit = [
     "*/migrations/*",
     "*/tests/*",

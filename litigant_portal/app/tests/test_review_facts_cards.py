@@ -107,11 +107,28 @@ def _badges(html):
     ]
 
 
-def test_facts_render_with_label_value_and_review_badge(client_thread):
-    html = _card_html(*client_thread, render_data=_data())
+@pytest.mark.parametrize(
+    ("source", "label"),
+    [
+        ({}, "Because you said:"),
+        ({"upload_id": "document-id"}, "From your document:"),
+    ],
+)
+def test_facts_render_with_label_value_and_review_badge(
+    client_thread, source, label
+):
+    facts = [
+        {**FACTS[0], "evidence": {"quote": "My name is Sandra."}},
+        {**FACTS[1], "evidence": {"quote": "I live in <Cass>.", **source}},
+    ]
+    html = _card_html(*client_thread, render_data=_data(facts=facts))
     assert TITLE in html
     assert "First name" in html and "Sandra" in html
     assert "County" in html and "Cass" in html
+    assert label in html
+    assert "I live in &lt;Cass&gt;." in html
+    assert "I live in <Cass>." not in html
+    assert "My name is Sandra." not in html
     # Both badges render per fact so the component can flip them on
     # confirm; only the one matching the stored state is visible.
     assert _badges(html) == [
@@ -180,7 +197,7 @@ def test_guided_page_is_offered_when_no_interview_is_available(
     assert f'href="{GUIDE_URL}"' in html
 
 
-def test_no_next_step_is_offered_without_a_registry_page(client_thread):
+def test_no_next_step_is_offered_when_the_topic_has_no_court(client_thread):
     html = _card_html(
         *client_thread,
         render_data=_data(

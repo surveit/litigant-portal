@@ -3,8 +3,10 @@ import uuid
 from django.core.files.storage import storages
 from django.db import models
 
+from litigant_portal.agents.bedrock import model_choices
+
 from .base import BaseModel
-from .choices import BedrockModel, ContactKind, JurisdictionLevel, State
+from .choices import ContactKind, JurisdictionLevel, State
 
 SITE_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 
@@ -39,13 +41,19 @@ class Site(BaseModel):
         max_length=128,
         blank=True,
         null=True,
-        choices=BedrockModel.choices,
+        choices=model_choices,
     )
     assistant_model = models.CharField(
         max_length=128,
         blank=True,
         null=True,
-        choices=BedrockModel.choices,
+        choices=model_choices,
+    )
+    judge_model = models.CharField(
+        max_length=128,
+        blank=True,
+        null=True,
+        choices=model_choices,
     )
 
     class Meta:
@@ -56,7 +64,6 @@ class Site(BaseModel):
         ]
         permissions = [
             ("manage_site", "Can manage the site"),
-            ("manage_developers", "Can manage developer access"),
             ("manage_app_users", "Can manage the app users' accounts"),
         ]
 

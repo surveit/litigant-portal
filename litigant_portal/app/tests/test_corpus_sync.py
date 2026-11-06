@@ -17,6 +17,7 @@ from django.test import TestCase, override_settings
 from litigant_portal.app.cache import (
     CONTACT_LIST_CACHE_KEY,
     RESOURCE_LIST_CACHE_KEY,
+    TOPIC_FLOW_LIST_CACHE_KEY,
 )
 from litigant_portal.app.models import (
     Contact,
@@ -32,6 +33,7 @@ from litigant_portal.app.models import (
 )
 from litigant_portal.app.selectors.corpus import CorpusSchema
 from litigant_portal.app.selectors.site import contact_list, resource_list
+from litigant_portal.app.selectors.topic_flow import topic_flow_list
 from litigant_portal.app.services import corpus as services
 from litigant_portal.app.services.corpus import corpus_sync
 
@@ -47,6 +49,7 @@ def _make_corpus(
     alpha_handoff=None,
     alpha_contacts=None,
     alpha_branding=None,
+    alpha_on_page=False,
 ):
     """A small valid corpus: two courts, two forms, one gated variable."""
     variables = {
@@ -128,6 +131,7 @@ def _make_corpus(
                 {
                     "title": "About your pet",
                     "variables": ["full_name", "pet_kind", "licensed"],
+                    "on_page": alpha_on_page,
                 }
             ],
             "packet": [{"form": "license"}],
@@ -309,8 +313,12 @@ class CourtScopingTests(CorpusSyncTests):
             {"pets", "eviction"},
         )
         self.assertEqual(Site.objects.get().court_name, court_name)
-        # Both courts' contacts land, each stamped with its court so the
+        # Both courts' rows land, each stamped with its court so the
         # guided page can pick its own.
+        self.assertEqual(
+            set(Topic.objects.values_list("court", "slug")),
+            {("alpha", "pets"), ("beta", "eviction")},
+        )
         self.assertEqual(
             set(Contact.objects.values_list("court", "name")),
             {("alpha", "Alpha Help"), ("beta", "Beta Help")},
@@ -415,12 +423,17 @@ class LayoutSyncTests(CorpusSyncTests):
 
     def test_an_authored_layout_is_stored_as_written(self):
         layout = ["packet", "start", "interview"]
-        self._sync(_make_corpus(alpha_layout=layout), court=None)
+        self._sync(
+            _make_corpus(alpha_layout=layout, alpha_on_page=True), court=None
+        )
         self.assertEqual(self._alpha_layout(), layout)
 
     def test_dropping_the_layout_restores_the_default_order(self):
         self._sync(
-            _make_corpus(alpha_layout=["packet", "start", "interview"]),
+            _make_corpus(
+                alpha_layout=["packet", "start", "interview"],
+                alpha_on_page=True,
+            ),
             court=None,
         )
         self._sync(_make_corpus(), court=None)
@@ -457,6 +470,26 @@ class HandoffSyncTests(CorpusSyncTests):
         flow = self._alpha()
         self.assertEqual(flow.interview_reference, "")
         self.assertEqual(flow.interview_prefill, {})
+
+
+@pytest.mark.postgres
+class InterviewPageSyncTests(CorpusSyncTests):
+    def _alpha_page(self):
+        flow = TopicFlow.objects.get(topic__slug="pets", slug="standard")
+        return flow.interview_pages.get()
+
+    def test_a_marked_page_is_stored_as_on_page(self):
+        self._sync(_make_corpus(alpha_on_page=True), court=None)
+        self.assertTrue(self._alpha_page().on_page)
+
+    def test_an_unmarked_page_is_stored_as_off_the_page(self):
+        self._sync(_make_corpus(), court=None)
+        self.assertFalse(self._alpha_page().on_page)
+
+    def test_dropping_the_mark_clears_it(self):
+        self._sync(_make_corpus(alpha_on_page=True), court=None)
+        self._sync(_make_corpus(), court=None)
+        self.assertFalse(self._alpha_page().on_page)
 
 
 @pytest.mark.postgres
@@ -577,7 +610,7 @@ class SourceKeyTests(CorpusSyncTests):
             Contact.objects.get(key="alpha_help").name, "Beta Help"
         )
 
-    def test_sync_drops_the_cached_contact_and_resource_lists(self):
+    def test_sync_drops_the_cached_contact_resource_and_flow_lists(self):
         self._sync(_make_corpus(), court=None)
         self.assertEqual(
             [c.key for c in contact_list()], ["alpha_help", "beta_help"]
@@ -585,9 +618,16 @@ class SourceKeyTests(CorpusSyncTests):
         self.assertEqual(
             [r.key for r in resource_list()], ["alpha_guide", "beta_guide"]
         )
+        # The test corpus enables no flow, so the warmed list is empty.
+        topic_flow_list()
+        self.assertIsNotNone(cache.get(TOPIC_FLOW_LIST_CACHE_KEY))
         with self.captureOnCommitCallbacks(execute=True):
             self._sync(_make_corpus(include_beta=False), court=None)
-        for key in (CONTACT_LIST_CACHE_KEY, RESOURCE_LIST_CACHE_KEY):
+        for key in (
+            CONTACT_LIST_CACHE_KEY,
+            RESOURCE_LIST_CACHE_KEY,
+            TOPIC_FLOW_LIST_CACHE_KEY,
+        ):
             self.assertIsNone(cache.get(key), key)
 
 

@@ -68,6 +68,20 @@ Read it as a loop:
 
 ---
 
+## Optional answer review
+
+Set **Judge model** in admin Settings to enable answer review; leave it disabled to retain token streaming. The engine reads `site_get().judge_model` directly. It buffers each generation, releases tool-bearing prose before dispatching tools, and sends final candidates to `agents/judge.py`. That module adapts the prototype verdict contract: schema-in-prompt JSON, validated with Pydantic, without a provider-specific structured-output mode.
+
+Judge requests contain text only: the candidate answer, textual conversation and tool results, and saved state. Native image/file blocks from every turn are replaced with an exclusion marker; attachment bytes and native file references are never forwarded to the judge. The original conversation is unchanged. The judge cannot inspect excluded attachments; it can use attachment information already represented in the supplied text.
+
+The `judging` SSE event uses the existing waiting indicator. A released final answer is stored before display. Rejected drafts are `meta=True` audit rows, excluded from subsequent conversation history; draft and findings remain in request-local history for up to two corrections. Judge completions have separate meta rows with verdicts, findings, and usage, available in the admin JSON export. Exhaustion releases the last draft; a judge call or parse failure also releases the answer. Both paths log a server warning and show a separate notice: "Warning: This answer could not be fully verified and may contain errors." The released message stores `review_warning: true`, carried through content events and reload items. Display and copying use the current template wording in the page's language, including for older messages that stored a warning string. Markdown exports mark the heading `[unverified]`; JSON exports preserve the stored metadata. The answer text and rejected audit drafts remain unchanged, and the warning metadata is excluded from model input. Database write failures use the existing error path and do not release the answer or notice.
+
+With judging enabled, `heartbeat` events mark each generation's start and received provider progress, throttled to one progress event every 10 seconds. They clear the previous checking state and reset the browser's 60-second stall watchdog without appending messages or scrolling; `judging` restores the checking state and keeps that watchdog armed. Generations and judge calls use a 45-second provider timeout with no retries, not a total turn deadline. Generation failures use the guided fallback. Judge failures retain `error: "judge_failed"` and include `error_category` (`timeout`, `provider_error`, or `invalid_output`) in the admin JSON export. Verdict parsing accepts one surrounding bare or JSON code fence, including whitespace around the boundary fences, while retaining strict validation and the original audit content. Correction messages are labeled as internal review feedback.
+
+Both the waiting copy and the warning copy for exhausted corrections or judge failures are provisional pending team agreement. Jessica's fail-open sign-off remains a team decision; do not enable judged chat for a pilot court before that sign-off. For the comparison, use the existing eval `current` system in separate runs with the Site judge setting off and on, keeping cases, references, and grading fixed. The eval config's `judge_model` selects the external grader, not this runtime judge.
+
+Include the review coverage limit in Jessica's pilot review: prose accompanying a tool call, including `RecordFact` or `ReviewFacts`, is released without judge approval and may contain substantive answers. The judge reviews the final generation only. This is separate from releasing a final answer after a judge error; sign-off on fail-open should not imply acceptance of the coverage limit. The judged configuration also changes generation timeouts and retries, so the eval comparison measures both effects. Use the [eval handoff checklist](../../scripts/agent_eval/README.md#judged-chat-handoff) to present them separately. Per-network-operation timeouts do not guarantee a maximum server silence or total turn duration.
+
 ## Anatomy of an agent
 
 An agent is a configuration object. It binds together five ingredients. The
@@ -85,9 +99,11 @@ completion_args = {"max_tokens": 1000}
 ```
 
 These are spread into `litellm.completion(...)`. **Don't put `model` here** — you'll get an error if you try.
-The model is supplied to the engine by the endpoint (from the site's
-model config via `site_get_model`), not the agent, and setting it in
-`completion_args` raises.
+The engine resolves the site's assistant preference through `site_get_model_target`, returning a concrete route from the families curated in `agents/bedrock.py`. Setting `model` in `completion_args` raises. The HTTP wrapper uses site defaults; direct service callers such as evaluations may pass a model string to `chat_stream` for a strict override. The engine adds no default chat token limit, so an agent's explicit limit is preserved and an omitted limit uses provider behavior.
+
+Unset assistant/fast roles use the first available Balanced/Economy model, currently GPT Terra/GPT Luna instead of the previous GPT Luna/Claude Haiku defaults. An unset assistant can fall back from Balanced to Economy; the fast role stays in Economy. Judging remains disabled until selected. Admin labels include the resolved release: family selections can advance when discovery refreshes and can differ across accounts. `AWS_REGION` is optional and defaults to `us-east-1`, while `BEDROCK_ALLOWED_GEOGRAPHY` is optional and defaults to `US`.
+
+Attachment hydration respects the resolved chat target's capabilities. Unsupported native documents or images become stubs for `QueryDocument`, which prefers the selected assistant when capable and otherwise uses the first enabled capable model in Economy, Balanced, then Best order. The saved assistant selection is unchanged.
 
 ### 2. The state — `state_schema`
 
@@ -355,7 +371,8 @@ Two pieces make this work:
 - **Generic views** — [`views/chat_engine.py`](../../litigant_portal/app/views/chat_engine.py)
   provides `stream`, `thread_list`, `message_list`, `thread_usage`, and
   `thread_delete` as abstract views. Each takes the surface's bindings as
-  keyword args: `agent_class`, `thread_type`, and (for `stream`) `model`.
+  keyword args: `agent_class` and `thread_type`. Streaming resolves the
+  site's model preference in the service.
 
 A surface module fills in those blanks and adds the HTTP concerns (method
 decorators, rate limits) plus any surface-specific endpoints.
@@ -364,7 +381,7 @@ example — it binds `LitigantAssistant` and adds the upload endpoints:
 
 ```python
 # litigant_portal/app/views/assistant.py
-THREAD_TYPE = "user_chat"
+from litigant_portal.app.models.chat_engine import USER_CHAT_THREAD_TYPE
 
 
 @require_POST
@@ -373,15 +390,14 @@ def stream(request: HttpRequest):
     return chat_engine.stream(
         request,
         agent_class=LitigantAssistant,
-        thread_type=THREAD_TYPE,
-        model=site_get_model(role="assistant"),
+        thread_type=USER_CHAT_THREAD_TYPE,
     )
 
 
 @require_GET
 @ratelimit(key="ip", rate="60/m", method="GET", block=True)
 def thread_list(request: HttpRequest) -> JsonResponse:
-    return chat_engine.thread_list(request, thread_type=THREAD_TYPE)
+    return chat_engine.thread_list(request, thread_type=USER_CHAT_THREAD_TYPE)
 ```
 
 Mount the surface under its own URL namespace in `urls.py`:
@@ -416,6 +432,10 @@ You won't edit this, but it helps to know the contract.
 - **State is pushed to the browser** via the `state` event after any step that
   ran tools, and returned on reload — which is how the artifact sidebar stays in
   sync.
+- **A saved fact is announced** with a `briefcase_changed` event, emitted after
+  `state` whenever a tool in that step set `refresh_system_prompt`. The chat
+  page re-fetches the briefcase panel on it, so a stored answer shows up while
+  the reply is still streaming.
 
 ### One canonical store, two projections
 
@@ -536,7 +556,7 @@ engine already uses for tool data and hidden messages.
    (each imported by its module path under `tools/`); export the agent from
    `agents/__init__.py`.
 7. Give it a surface: a view module that binds the generic `views/chat_engine.py`
-   views with your `agent_class`, a unique `thread_type`, and a model (see
+   views with your `agent_class` and a unique `thread_type` (see
    `views/assistant.py`), mounted under `api/agents/<name>/` in `urls.py`.
 
 No engine edits. No frontend edits (unless you _want_ custom cards). That's the

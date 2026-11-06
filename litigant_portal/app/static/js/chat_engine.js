@@ -236,6 +236,7 @@ function blankMessage() {
     id: 0,
     content: '',
     html: '',
+    reviewWarning: false,
     isUser: false,
     isAssistant: false,
     isTool: false,
@@ -262,7 +263,7 @@ function blankMessage() {
 // Build a message with precomputed style classes + rendered markdown (CSP-safe
 // — the template binds dot-paths only, no expressions).
 let messageSeq = 0
-function makeMessage(role, content, attachments) {
+function makeMessage(role, content, attachments, reviewWarning = false) {
   const isUser = role === 'user'
   const atts = attachments || []
   return {
@@ -270,6 +271,7 @@ function makeMessage(role, content, attachments) {
     id: ++messageSeq,
     role,
     content,
+    reviewWarning: !!reviewWarning,
     html: isUser ? '' : renderMarkdown(content),
     isUser,
     isAssistant: !isUser,
@@ -414,7 +416,8 @@ function buildItem(item) {
   return makeMessage(
     item.kind,
     item.content,
-    (item.attachments || []).map(messageAttachment)
+    (item.attachments || []).map(messageAttachment),
+    item.review_warning
   )
 }
 
@@ -422,6 +425,10 @@ const MAX_INPUT_HEIGHT = 160
 
 // Title shown for threads that don't have a generated description yet.
 const NEW_CHAT_TITLE = 'New chat'
+
+// Shape of a thread id, as the "threads/<uuid:thread_id>/" route accepts it.
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 // --- Attachments -------------------------------------------------------------
 
@@ -522,6 +529,10 @@ document.addEventListener('alpine:init', () => {
     // Mount point of the agent's API (e.g. "/api/agents/assistant/") — the
     // component itself is agent-agnostic.
     base: '',
+    reviewWarningText: '',
+    // Server-rendered briefcase fragment, re-fetched when a tool saves a fact.
+    briefcaseUrl: '',
+    briefcaseFetches: 0,
     // History sidebar
     threads: [],
     showEmpty: false,
@@ -532,10 +543,14 @@ document.addEventListener('alpine:init', () => {
     threadId: null,
     threadTitle: '',
     streaming: false,
+    // True while openThread() is fetching, so a send can't race the load
+    // and land in the wrong thread.
+    loadingThread: false,
     sendDisabled: true,
     menuOpen: false,
     confirmingDelete: false,
     thinkingVisible: false,
+    checkingVisible: false,
     // The in-flight stream context, if any. It owns the message array it
     // writes into, so switching threads mid-stream just detaches the view
     // while the stream keeps filling its own buffer in the background.
@@ -569,9 +584,30 @@ document.addEventListener('alpine:init', () => {
 
     init() {
       this.base = this.$root.dataset.agentBase
+      this.reviewWarningText = this.$root.dataset.reviewWarning
+      this.briefcaseUrl = this.$root.dataset.briefcaseUrl
       setCitationChips(this.$root.dataset.citationChips === 'true')
       this.loadThreads()
+      this.consumeQueryThread()
       this.consumeQueryMessage()
+    },
+
+    // Landing with "?thread=..." opens that thread (the home page's static
+    // Activity list links here). The param is stripped like "?q=" below, so
+    // a refresh or share of the page won't re-pin the thread. Only a UUID is
+    // accepted: anything else is URL input that must not reach the fetch.
+    consumeQueryThread() {
+      const params = new URLSearchParams(window.location.search)
+      if (!params.has('thread')) return
+      const threadId = (params.get('thread') || '').trim()
+      params.delete('thread')
+      const query = params.toString()
+      const url =
+        window.location.pathname +
+        (query ? '?' + query : '') +
+        window.location.hash
+      window.history.replaceState(null, '', url)
+      if (UUID_RE.test(threadId)) this.openThread(threadId)
     },
 
     // Landing with "?q=..." fires that message as the start of a fresh chat.
@@ -747,10 +783,14 @@ document.addEventListener('alpine:init', () => {
         return
       }
 
+      this.loadingThread = true
+      this.clearInput()
+      this.clearAttachments()
       try {
-        const res = await fetch(this.base + 'threads/' + threadId + '/', {
-          headers: { Accept: 'application/json' },
-        })
+        const res = await fetch(
+          this.base + 'threads/' + encodeURIComponent(threadId) + '/',
+          { headers: { Accept: 'application/json' } }
+        )
         if (!res.ok) throw new Error('Request failed: ' + res.status)
         const data = await res.json()
         this.threadId = data.id
@@ -758,13 +798,14 @@ document.addEventListener('alpine:init', () => {
         this.messages = (data.items || []).map(buildItem)
         this.setState(data.state)
         this.conversationEmpty = this.messages.length === 0
-        this.clearInput()
-        this.clearAttachments()
         this.markActive()
         this.updateThinking()
         this.scrollToBottom()
       } catch (e) {
         console.error('Failed to load thread:', e)
+      } finally {
+        this.loadingThread = false
+        this.refreshSendState()
       }
     },
 
@@ -776,9 +817,11 @@ document.addEventListener('alpine:init', () => {
       this.refreshSendState()
     },
 
-    // The send button is disabled while streaming or when the input is empty.
+    // The send button is disabled while streaming, while a thread is
+    // loading, or when the input is empty.
     refreshSendState() {
-      this.sendDisabled = this.streaming || !this.input.trim()
+      this.sendDisabled =
+        this.streaming || this.loadingThread || !this.input.trim()
     },
 
     handleKeydown(e) {
@@ -803,7 +846,7 @@ document.addEventListener('alpine:init', () => {
 
     send() {
       const message = this.input.trim()
-      if (!message || this.streaming) return
+      if (!message || this.streaming || this.loadingThread) return
       this.clearInput()
       this.sendMessage(message, this.threadId)
     },
@@ -825,6 +868,7 @@ document.addEventListener('alpine:init', () => {
         terminal: false,
         receivedFirstStreamEvent: false,
         inFlightToolIds: [],
+        judging: false,
         controller: new AbortController(),
       }
       this.activeStream = stream
@@ -917,6 +961,41 @@ document.addEventListener('alpine:init', () => {
         this.updateThinking()
         this.refreshSendState()
         this.loadThreads()
+        // Wait for Alpine to re-enable the input without taking focus elsewhere.
+        this.$nextTick(() => {
+          if (
+            this.attached(stream) &&
+            !this.streaming &&
+            !this.attachOpen &&
+            !this.confirmingDelete &&
+            document.hasFocus() &&
+            document.activeElement === document.body
+          ) {
+            this.$refs.input?.focus({ preventScroll: true })
+          }
+        })
+      }
+    },
+
+    // Swap in the server-rendered briefcase when a tool saved or corrected
+    // an answer (#941). Django renders the panel; this only replaces the
+    // mounted copy with the fresh markup. Only the latest fetch swaps, so an
+    // earlier response that resolves late can't put back stale facts.
+    async refreshBriefcase() {
+      if (!this.briefcaseUrl) return
+      const fetchId = ++this.briefcaseFetches
+      try {
+        const res = await fetch(this.briefcaseUrl)
+        if (!res.ok) throw new Error('Request failed: ' + res.status)
+        const fresh = new DOMParser()
+          .parseFromString(await res.text(), 'text/html')
+          .querySelector('[data-briefcase-facts]')
+        if (!fresh || fetchId !== this.briefcaseFetches) return
+        this.$root.querySelectorAll('[data-briefcase-facts]').forEach((el) => {
+          el.replaceWith(fresh.cloneNode(true))
+        })
+      } catch (e) {
+        console.error('Failed to refresh briefcase:', e)
       }
     },
 
@@ -932,6 +1011,13 @@ document.addEventListener('alpine:init', () => {
       if (stream.inFlightToolIds.length === 0) {
         resetStallTimer(this, stream)
       }
+      if (event.type === 'heartbeat') {
+        if (stream.judging) {
+          stream.judging = false
+          if (this.attached(stream)) this.updateThinking()
+        }
+        return
+      }
       if (event.type === 'thread') {
         stream.threadId = event.thread_id
         this.setThreadStatus(stream.threadId, 'streaming')
@@ -943,9 +1029,13 @@ document.addEventListener('alpine:init', () => {
         }
         // Surface the new thread's row (and its dot) right away.
         this.loadThreads()
+      } else if (event.type === 'judging') {
+        stream.judging = true
       } else if (event.type === 'content_delta') {
-        this.appendContent(stream, event.content || '')
+        stream.judging = false
+        this.appendContent(stream, event.content || '', event.review_warning)
       } else if (event.type === 'tool_call') {
+        stream.judging = false
         // A new tool starts a fresh text run after it.
         stream.openIndex = null
         stream.messages.push(makeToolFromCall(event))
@@ -966,9 +1056,13 @@ document.addEventListener('alpine:init', () => {
         if (this.attached(stream)) this.threadTitle = event.description
       } else if (event.type === 'state') {
         if (this.attached(stream)) this.setState(event.state)
+      } else if (event.type === 'briefcase_changed') {
+        // Session-scoped, not thread-scoped: refresh even for a detached stream.
+        this.refreshBriefcase()
       } else if (event.type === 'error') {
         this.failStream(stream, event)
       } else if (event.type === 'done') {
+        stream.judging = false
         stream.terminal = true
         clearStreamTimers(stream)
       }
@@ -987,6 +1081,7 @@ document.addEventListener('alpine:init', () => {
 
     failStream(stream, event = {}) {
       if (stream.failureRendered || stream.terminal) return
+      stream.judging = false
       stream.failureRendered = true
       stream.terminal = true
       clearStreamTimers(stream)
@@ -1011,7 +1106,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     // Append streamed content to the open assistant part (creating it lazily).
-    appendContent(stream, text) {
+    appendContent(stream, text, reviewWarning = false) {
       if (text) stream.hadAssistantText = true
       if (stream.openIndex === null) {
         stream.messages.push(makeMessage('assistant', ''))
@@ -1022,6 +1117,7 @@ document.addEventListener('alpine:init', () => {
       stream.messages[stream.openIndex] = {
         ...msg,
         content,
+        reviewWarning: !!reviewWarning || msg.reviewWarning,
         html: renderMarkdown(content),
       }
     },
@@ -1058,12 +1154,19 @@ document.addEventListener('alpine:init', () => {
     // streaming text is already the most recent thing on screen. Only the
     // stream attached to the visible thread shows it.
     updateThinking() {
+      this.checkingVisible = false
       if (
         !this.streaming ||
         !this.activeStream ||
+        this.activeStream.terminal ||
         !this.attached(this.activeStream)
       ) {
         this.thinkingVisible = false
+        return
+      }
+      if (this.activeStream.judging) {
+        this.thinkingVisible = true
+        this.checkingVisible = true
         return
       }
       const last = this.messages[this.messages.length - 1]
@@ -1083,8 +1186,14 @@ document.addEventListener('alpine:init', () => {
       const id = Number(e.currentTarget.dataset.messageId)
       const message = this.messages.find((m) => m.id === id)
       if (!message) return
-      if (navigator.clipboard)
-        navigator.clipboard.writeText(copyableText(message.content))
+      if (navigator.clipboard) {
+        const content = copyableText(message.content)
+        navigator.clipboard.writeText(
+          message.reviewWarning
+            ? this.reviewWarningText + '\n\n' + content
+            : content
+        )
+      }
       message.copied = true
       message.notCopied = false
       setTimeout(() => {
@@ -1428,6 +1537,7 @@ document.addEventListener('alpine:init', () => {
       this.showNote('stale-note', false)
       this.showAll('badge-pending', false)
       this.showAll('badge-confirmed', true)
+      this.showAll('evidence', false)
     },
 
     showAll(role, show) {

@@ -1,20 +1,67 @@
-"""Safe fallback payloads for failed assistant streams."""
+"""Safe fallback payloads for failed assistant streams, and the events a
+healthy tool round emits. All DB-free: the engine's collaborators are patched."""
 
 import json
 import uuid
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 from django.test import SimpleTestCase
 from django.urls import reverse
 
 from litigant_portal.agents.base import Agent, ToolOutput
+from litigant_portal.agents.bedrock import ResolvedBedrockModel
+from litigant_portal.app.models import Topic, TopicFlow
+from litigant_portal.app.selectors.bedrock import BedrockModelUnavailable
 from litigant_portal.app.services.chat_engine import chat_stream
+
+pytestmark = pytest.mark.usefixtures("resolved_bedrock_model")
 
 
 class FailingAgent(Agent):
     def generate_system_prompt(self, *, thread_id) -> str:
         return "Test prompt"
+
+
+def _flow(court="franklin-county-oh"):
+    return TopicFlow(
+        topic=Topic(slug="eviction", court=court),
+        slug="tenant",
+        name="Tenant eviction guide",
+    )
+
+
+def _text_chunk(content):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=content, tool_calls=[])
+            )
+        ]
+    )
+
+
+def _tool_chunk(*call_ids):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=[
+                        SimpleNamespace(
+                            index=index,
+                            id=call_id,
+                            function=SimpleNamespace(
+                                name="tool", arguments="{}"
+                            ),
+                        )
+                        for index, call_id in enumerate(call_ids)
+                    ],
+                )
+            )
+        ]
+    )
 
 
 class ChatStreamFallbackTests(SimpleTestCase):
@@ -28,7 +75,7 @@ class ChatStreamFallbackTests(SimpleTestCase):
             save=Mock(),
         )
 
-    def stream_events(self, completions=None):
+    def stream_events(self, completions=None, *, model="test-model"):
         with (
             patch(
                 "litigant_portal.app.services.chat_engine.litellm.completion",
@@ -37,13 +84,13 @@ class ChatStreamFallbackTests(SimpleTestCase):
                     if completions is not None
                     else RuntimeError("secret-provider-detail")
                 ),
-            ),
+            ) as completion,
             patch(
                 "litigant_portal.app.services.chat_engine.litellm.token_counter",
                 return_value=0,
             ),
             patch(
-                "litigant_portal.app.services.chat_engine._resolve_thread",
+                "litigant_portal.app.services.chat_engine.chat_thread_get",
                 return_value=self.thread,
             ),
             patch(
@@ -67,7 +114,7 @@ class ChatStreamFallbackTests(SimpleTestCase):
                 message="Please help.",
                 agent_class=FailingAgent,
                 thread_type="test_agent",
-                model="test-model",
+                model=model,
                 thread_id=str(self.thread.id),
             )
             events = [
@@ -79,34 +126,47 @@ class ChatStreamFallbackTests(SimpleTestCase):
             self.persisted_messages = [
                 call.kwargs["data"] for call in create_message.call_args_list
             ]
+            self.completion_calls = completion.call_args_list
             return events
+
+    def test_explicit_model_pin_reaches_inference(self):
+        model_id = "anthropic.claude-haiku-4-5-20251001-v1:0"
+        pinned = f"bedrock_mantle/{model_id}"
+        resolved = f"bedrock/converse/us-east-1/us.{model_id}"
+        with patch(
+            "litigant_portal.app.services.chat_engine.bedrock_model_target",
+            return_value=ResolvedBedrockModel(resolved, "us-east-1"),
+        ) as resolve:
+            events = self.stream_events(
+                [iter([_text_chunk("Answer")])], model=pinned
+            )
+        resolve.assert_called_once_with(
+            model=pinned, required=frozenset({"text", "stream"})
+        )
+        self.assertEqual(self.completion_calls[0].kwargs["model"], resolved)
+        self.assertIn({"type": "content_delta", "content": "Answer"}, events)
+
+    def test_default_chat_budget_is_left_to_the_provider(self):
+        self.stream_events([iter([_text_chunk("Answer")])])
+        self.assertNotIn("max_tokens", self.completion_calls[0].kwargs)
+
+    def test_agent_defined_chat_budget_is_preserved(self):
+        with patch.object(
+            FailingAgent, "completion_args", {"max_tokens": 321}
+        ):
+            self.stream_events([iter([_text_chunk("Answer")])])
+        self.assertEqual(self.completion_calls[0].kwargs["max_tokens"], 321)
 
     def test_active_valid_flow_gets_guided_fallback_and_safe_error(self):
         self.thread.state = {"active_topic_flow": "eviction/tenant"}
-        flow = SimpleNamespace(
-            topic=SimpleNamespace(slug="eviction"),
-            slug="tenant",
-            name="Tenant eviction guide",
-        )
-        track = {
-            "court": "franklin-county-oh",
-            "topic": "eviction",
-            "role": "tenant",
-        }
 
-        with (
-            patch(
-                "litigant_portal.app.services.chat_engine.topic_flow_from_path",
-                return_value=flow,
-            ) as from_path,
-            patch(
-                "litigant_portal.app.services.chat_engine.topic_flow_track_find",
-                return_value=track,
-            ) as track_find,
-        ):
+        with patch(
+            "litigant_portal.app.services.chat_engine.topic_flow_from_path",
+            return_value=_flow(),
+        ) as from_path:
             events = self.stream_events()
-            from_path.assert_called_once_with("eviction/tenant")
-            track_find.assert_called_once_with(flow)
+            # The fallback reads three fields; the content graph stays home.
+            from_path.assert_called_once_with("eviction/tenant", graph=False)
         error = next(event for event in events if event["type"] == "error")
 
         self.assertEqual(
@@ -143,17 +203,11 @@ class ChatStreamFallbackTests(SimpleTestCase):
             with self.subTest(state=state):
                 self.thread.state = state
 
-                with (
-                    patch(
-                        "litigant_portal.app.services.chat_engine.topic_flow_from_path",
-                        return_value=None,
-                    ),
-                    patch(
-                        "litigant_portal.app.services.chat_engine.topic_flow_track_find"
-                    ) as track_find,
+                with patch(
+                    "litigant_portal.app.services.chat_engine.topic_flow_from_path",
+                    return_value=None,
                 ):
                     events = self.stream_events()
-                    track_find.assert_not_called()
                 error = next(
                     event for event in events if event["type"] == "error"
                 )
@@ -174,22 +228,14 @@ class ChatStreamFallbackTests(SimpleTestCase):
         self.thread.state = {"active_topic_flow": "eviction/tenant"}
         for resolver in (
             "topic_flow_from_path",
-            "topic_flow_track_find",
+            "topic_flow_url_kwargs",
             "reverse",
         ):
             with (
                 self.subTest(resolver=resolver),
                 patch(
                     "litigant_portal.app.services.chat_engine.topic_flow_from_path",
-                    return_value=SimpleNamespace(name="Guide"),
-                ),
-                patch(
-                    "litigant_portal.app.services.chat_engine.topic_flow_track_find",
-                    return_value={
-                        "court": "court",
-                        "topic": "topic",
-                        "role": "role",
-                    },
+                    return_value=_flow(),
                 ),
                 patch(
                     f"litigant_portal.app.services.chat_engine.{resolver}",
@@ -210,17 +256,11 @@ class ChatStreamFallbackTests(SimpleTestCase):
                 self.assertNotIn("secret-provider-detail", payload)
                 self.assertNotIn("secret-resolution-detail", payload)
 
-    def test_unmatched_track_falls_back_to_home(self):
+    def test_topic_without_a_court_falls_back_to_home(self):
         self.thread.state = {"active_topic_flow": "eviction/tenant"}
-        with (
-            patch(
-                "litigant_portal.app.services.chat_engine.topic_flow_from_path",
-                return_value=SimpleNamespace(name="Guide"),
-            ),
-            patch(
-                "litigant_portal.app.services.chat_engine.topic_flow_track_find",
-                return_value=None,
-            ),
+        with patch(
+            "litigant_portal.app.services.chat_engine.topic_flow_from_path",
+            return_value=_flow(court=""),
         ):
             events = self.stream_events()
 
@@ -263,6 +303,35 @@ class ChatStreamFallbackTests(SimpleTestCase):
                 )
                 self.thread.save.assert_not_called()
 
+    def test_description_discovery_failure_does_not_fail_the_reply(self):
+        self.thread.description = ""
+        chunk = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="Here is help.", tool_calls=[]
+                    ),
+                    finish_reason="stop",
+                )
+            ]
+        )
+        with (
+            patch(
+                "litigant_portal.app.services.chat_engine.site_get_model_target",
+                side_effect=BedrockModelUnavailable("No eligible Haiku"),
+            ),
+            self.assertLogs(
+                "litigant_portal.app.services.chat_engine", level="ERROR"
+            ),
+        ):
+            events = self.stream_events(completions=[iter([chunk])])
+        self.assertEqual(events[-1], {"type": "done"})
+        self.assertNotIn("error", [event["type"] for event in events])
+        self.assertIn(
+            {"role": "assistant", "content": "Here is help."},
+            self.persisted_messages,
+        )
+
     def test_midstream_provider_failure_preserves_text_and_emits_safe_fallback(
         self,
     ):
@@ -293,33 +362,8 @@ class ChatStreamFallbackTests(SimpleTestCase):
         )
 
     def test_normal_text_and_tool_turns_still_complete(self):
-        text_chunk = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content="Healthy answer", tool_calls=[]
-                    )
-                )
-            ]
-        )
-        tool_chunk = SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                index=0,
-                                id="call-1",
-                                function=SimpleNamespace(
-                                    name="tool", arguments="{}"
-                                ),
-                            )
-                        ],
-                    )
-                )
-            ]
-        )
+        text_chunk = _text_chunk("Healthy answer")
+        tool_chunk = _tool_chunk("call-1")
         for with_tool in (False, True):
             with (
                 self.subTest(with_tool=with_tool),
@@ -362,3 +406,58 @@ class ChatStreamFallbackTests(SimpleTestCase):
                 self.thread.refresh_from_db.assert_called_with(
                     fields=["state"]
                 )
+
+    def test_tool_round_that_stores_a_fact_announces_it_after_its_responses(
+        self,
+    ):
+        # Two tools in one round, only the first stores something: the
+        # announcement comes once, after both responses and the state push,
+        # so the panel refetch sees every write from the round.
+        with patch(
+            "litigant_portal.app.services.chat_engine._execute_tool",
+            side_effect=[
+                ToolOutput(result="Saved", refresh_system_prompt=True),
+                ToolOutput(result="Nothing to save"),
+            ],
+        ):
+            events = self.stream_events(
+                completions=[
+                    iter([_tool_chunk("call-1", "call-2")]),
+                    iter([_text_chunk("Healthy answer")]),
+                ]
+            )
+
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "thread",
+                "state",
+                "tool_call",
+                "tool_response",
+                "tool_call",
+                "tool_response",
+                "state",
+                "briefcase_changed",
+                "content_delta",
+                "done",
+            ],
+        )
+        self.assertEqual(events[7], {"type": "briefcase_changed"})
+
+    def test_tool_round_that_stores_nothing_announces_no_briefcase_change(
+        self,
+    ):
+        with patch(
+            "litigant_portal.app.services.chat_engine._execute_tool",
+            return_value=ToolOutput(result="Tool finished"),
+        ):
+            events = self.stream_events(
+                completions=[
+                    iter([_tool_chunk("call-1")]),
+                    iter([_text_chunk("Healthy answer")]),
+                ]
+            )
+
+        self.assertNotIn(
+            "briefcase_changed", [event["type"] for event in events]
+        )

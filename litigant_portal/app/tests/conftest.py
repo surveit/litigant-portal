@@ -6,6 +6,23 @@ from litigant_portal.app.cache import SITE_CACHE_KEY
 from litigant_portal.app.models import Site
 
 
+@pytest.fixture
+def resolved_bedrock_model(monkeypatch):
+    """
+    Isolate unrelated engine tests from AWS catalog discovery.
+    """
+    from litigant_portal.agents.bedrock import ResolvedBedrockModel
+
+    monkeypatch.setattr(
+        "litigant_portal.app.services.chat_engine.bedrock_model_target",
+        lambda *, model, **kwargs: ResolvedBedrockModel(
+            model,
+            "us-east-1",
+            capabilities=frozenset({"text", "image", "document"}),
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
 def test_cache(settings):
     """Patch settings to isolate tests from Redis."""
@@ -41,6 +58,17 @@ def blank_site_without_a_database(request, test_cache):
     """
     if not _uses_database(request):
         cache.set(SITE_CACHE_KEY, Site())
+
+
+@pytest.fixture(autouse=True)
+def no_flow_rows_without_a_database(request, monkeypatch):
+    """The tester menu lists the flow rows on every page render where
+    tester tools are on; a test with no database access gets none."""
+    if not _uses_database(request):
+        monkeypatch.setattr(
+            "litigant_portal.app.context_processors.topic_flow_list",
+            lambda: [],
+        )
 
 
 @pytest.fixture(autouse=True)

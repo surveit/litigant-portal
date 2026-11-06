@@ -582,12 +582,17 @@
             <c-atoms.alert variant="success">Success alert message.</c-atoms.alert>
             <c-atoms.alert variant="warning">Warning alert message.</c-atoms.alert>
             <c-atoms.alert variant="danger">Danger alert message.</c-atoms.alert>
+            <c-atoms.alert variant="warning" role="">Warning without an interrupting alert announcement.</c-atoms.alert>
           </div>
           <h4 class="mt-8">Props</h4>
           <div class="bg-greyscale-100 rounded-xl p-4 my-3">
             <div class="flex flex-col md:flex-row">
               <span class="p-2.5 md:w-48 md:min-w-48 font-medium"><code>variant</code></span>
               <span class="p-2.5">"info" (default) | "success" | "warning" | "danger"</span>
+            </div>
+            <div class="flex flex-col md:flex-row">
+              <span class="p-2.5 md:w-48 md:min-w-48 font-medium"><code>role</code></span>
+              <span class="p-2.5">"alert" (default). Set to "" to omit the role, such as inside an existing live region.</span>
             </div>
           </div>
         </section>
@@ -819,7 +824,10 @@
             <code>:answer</code> prop. The label falls back to the
             variable's name, and the value comes from
             <code>display_value</code>, so lists and booleans read as words
-            rather than Python literals.
+            rather than Python literals. A private fact (the variable's
+            <code>is_private</code> flag) renders masked, with a reveal
+            button that shows the value on request. Without JavaScript the
+            row stays masked and no button is shown.
           </p>
           <dl class="space-y-2.5 max-w-xs mb-6">
             {% for answer in briefcase_groups.0.answers %}
@@ -1157,7 +1165,7 @@
         </section>
         <section id="topic-grid" class="mb-12" aria-labelledby="topic-grid-heading">
           <h3 id="topic-grid-heading" class="mb-4">Topic Grid</h3>
-          <p class="text-greyscale-600 mb-6">Responsive grid of topic cards.</p>
+          <p class="text-greyscale-600 mb-6">Responsive grid of topic cards, one per enabled guided flow, each opening that flow's page (#1068).</p>
           <div class="border border-greyscale-200 rounded-lg overflow-hidden mb-6">
             <c-organisms.topic-grid />
           </div>
@@ -1183,7 +1191,7 @@
             Always renders. With no facts it shows its empty state rather
             than collapsing, because the panel is a fixed part of the chat
             frame. A raw agent-state disclosure appears at the bottom for
-            users holding <code>manage_developers</code>.
+            users holding <code>manage_site</code> (FLP Staff).
           </p>
           <div class="border border-greyscale-200 rounded-lg overflow-hidden mb-6 max-w-sm flex flex-col">
             <c-organisms.briefcase-panel :groups="briefcase_groups" />

@@ -1,8 +1,8 @@
 import importlib
 import os
+import runpy
 from unittest import mock
 
-from django.core.exceptions import ImproperlyConfigured
 from django.test import SimpleTestCase
 
 import litigant_portal.settings
@@ -23,24 +23,32 @@ class GitShaSettingTests(SimpleTestCase):
         self.assertEqual(module.GIT_SHA, "abc1234")
 
 
-class TopicFlowSourceSettingTests(SimpleTestCase):
-    """Tests for TOPIC_FLOW_SOURCE, which picks the guided page's source."""
+class BedrockSettingTests(SimpleTestCase):
+    def test_region_defaults_to_us_east_1_and_preserves_overrides(self):
+        for value, expected in (
+            (None, "us-east-1"),
+            ("", "us-east-1"),
+            ("   ", "us-east-1"),
+            (" us-west-2 ", "us-west-2"),
+            ("eu-west-1", "eu-west-1"),
+        ):
+            with self.subTest(value=value):
+                environ = {} if value is None else {"AWS_REGION": value}
+                with mock.patch.dict(os.environ, environ, clear=True):
+                    config = runpy.run_path(litigant_portal.settings.__file__)
+                self.assertEqual(config["AWS_REGION"], expected)
 
-    def _reload_settings(self, environ):
-        # A failed reload leaves the module half-executed, so put it back.
-        self.addCleanup(importlib.reload, litigant_portal.settings)
-        with mock.patch.dict(os.environ, environ, clear=True):
-            return importlib.reload(litigant_portal.settings)
-
-    def test_topic_flow_source_defaults_to_content(self):
-        self.assertEqual(
-            self._reload_settings({}).TOPIC_FLOW_SOURCE, "content"
-        )
-
-    def test_topic_flow_source_accepts_corpus(self):
-        module = self._reload_settings({"TOPIC_FLOW_SOURCE": "corpus"})
-        self.assertEqual(module.TOPIC_FLOW_SOURCE, "corpus")
-
-    def test_unknown_source_setting_is_rejected(self):
-        with self.assertRaises(ImproperlyConfigured):
-            self._reload_settings({"TOPIC_FLOW_SOURCE": "bogus"})
+    def test_geography_is_optional_and_defaults_to_us(self):
+        for value in (None, "", "   ", "us"):
+            with self.subTest(value=value):
+                environ = (
+                    {}
+                    if value is None
+                    else {"BEDROCK_ALLOWED_GEOGRAPHY": value}
+                )
+                with mock.patch.dict(os.environ, environ, clear=True):
+                    config = runpy.run_path(litigant_portal.settings.__file__)
+                self.assertEqual(
+                    config["BEDROCK_ALLOWED_GEOGRAPHY"],
+                    "US",
+                )

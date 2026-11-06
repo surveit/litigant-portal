@@ -1,14 +1,13 @@
 # Eviction (Franklin County, OH), TENANT role. The directory locates the
 # court and topic; the file name is the flow slug. The tenant corpus has no
 # form packet yet (response forms are #610), so there is no packet and no
-# links. Ported from the wip library flow config; the content/ copy retires
-# once the page renders from these rows (#1012).
+# links. Ported from the wip library flow config.
 
 name: 'Responding to an Eviction (Tenant)'
 enabled: true
 order: 0
 
-# The page in the order content/ shows it. No `packet`: no forms yet (#610).
+# The page, top to bottom. No `packet`: no forms yet (#610).
 layout:
   - overview
   - notice_to_leave
@@ -105,8 +104,10 @@ sections:
 
       You may be able to agree with your landlord on a move-out date instead. That saves the landlord the cost of the writ and gives you certainty about your timing. Put any agreement in writing.
 
+# The guided page asks only the pages marked `on_page` (#1046).
 interview:
   - title: 'Your key dates'
+    on_page: true
     variables:
       - eviction_papers_received_date
       - eviction_hearing_date

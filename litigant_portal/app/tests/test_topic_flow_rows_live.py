@@ -1,12 +1,11 @@
 """The guided page built from rows, against the real corpus.
 
 Postgres tests that sync ``litigant_portal/corpus/`` for real (no fake).
-The first renders every enabled flow under ``TOPIC_FLOW_SOURCE=corpus`` and
-saves one North Dakota page through real glossary rows, so a corpus change
-the page cannot render fails here, in CI, rather than on a partner's
-instance. The second builds the ND calendar and contacts files under both
-settings and compares their bytes (#1017). The Python-built corpus tests
-live in ``test_topic_flow_rows_view.py``.
+The first renders every enabled flow and saves one North Dakota page through
+real glossary rows, so a corpus change the page cannot render fails here, in
+CI, rather than on a partner's instance. The second builds the ND calendar
+and contacts files (#1017). The Python-built corpus tests live in
+``test_topic_flow_rows_view.py``.
 """
 
 import re
@@ -21,11 +20,11 @@ from litigant_portal.app.services.topic_flow import variable_answer_set
 
 
 def _expected_anchors(flow):
-    """The layout with the interview block expanded to its pages."""
+    """The layout with the interview block expanded to its marked pages."""
     anchors = []
     for name in flow.layout:
         if name == "interview":
-            pages = flow.interview_pages.count()
+            pages = flow.interview_pages.filter(on_page=True).count()
             anchors += [f"interview-{n}" for n in range(1, pages + 1)]
         else:
             anchors.append(name)
@@ -36,7 +35,6 @@ def _expected_anchors(flow):
 def test_every_live_flow_renders_with_an_anchor_per_section_key(
     client, db, settings
 ):
-    settings.TOPIC_FLOW_SOURCE = "corpus"
     settings.CORPUS_COURT = None
     corpus_sync(strict=True)
     court_of = {topic: court for court, topic in corpus_load_topics()}
@@ -56,17 +54,12 @@ def test_every_live_flow_renders_with_an_anchor_per_section_key(
             anchors
         ), url
 
-    # Save the "The name you want" page of the ND standard flow: three text
-    # variables, two required, none gated, all private, so the blank middle
-    # name is "keep", not "erase", and writes no row. The anchor is not
-    # hard-coded, since page order in standard.yml can change.
+    # Save the "The filing fee" page of the ND standard flow: one boolean
+    # the packet reacts to. The anchor is not hard-coded, since page order
+    # in standard.yml can change.
     url = "/t/north-dakota/adult-name-change/standard/"
-    posted = {
-        "name_change_requested_first": " Jane ",
-        "name_change_requested_middle": "",
-        "name_change_requested_last": "Doe",
-    }
-    response = client.post(url, posted)
+    assert "Petition for Fee Waiver" not in client.get(url).content.decode()
+    response = client.post(url, {"name_change_fee_waiver_needed": "true"})
     assert response.status_code == 302
     assert response["Location"].startswith(f"{url}#interview-")
     stored = dict(
@@ -74,41 +67,30 @@ def test_every_live_flow_renders_with_an_anchor_per_section_key(
             "variable__name", "value"
         )
     )
-    assert stored == {
-        "name_change_requested_first": "Jane",
-        "name_change_requested_last": "Doe",
-    }
+    assert stored == {"name_change_fee_waiver_needed": True}
+    assert "Petition for Fee Waiver" in client.get(url).content.decode()
 
 
-# --- the ND output files on both paths --------------------------------------
+# --- the ND output files ----------------------------------------------------
 
 ND_FLOW = "north-dakota-adult-name-change-standard"
 ND_URL = "/t/north-dakota/adult-name-change/standard/"
-# Content section id -> corpus block name, the one segment the UID and the
-# filename change by on the corpus path.
-ND_FILES = {"deadlines_calendar": "calendar", "save_contacts": "contacts"}
 
 
-def _download(client, settings, source, output_id):
-    settings.TOPIC_FLOW_SOURCE = source
-    response = client.get(f"{ND_URL}download/{output_id}/")
-    assert response.status_code == 200, (source, output_id)
-    return response
-
-
-def _normalized(response, segment):
-    """The file's bytes with the two things that differ by design taken
-    out: the generated DTSTAMP and the UID segment naming ``segment``.
-    Lines are unfolded first, as a UID's length moves the fold."""
-    body = response.content.decode().replace("\r\n ", "")
-    body = re.sub(r"DTSTAMP:\d{8}T\d{6}Z", "DTSTAMP:<now>", body)
-    return body.replace(f"UID:{ND_FLOW}-{segment}-", "UID:<flow>-")
+def _download(client, block):
+    response = client.get(f"{ND_URL}download/{block}/")
+    assert response.status_code == 200, block
+    assert f'filename="{block}.' in response["Content-Disposition"]
+    # Unfold the lines first, as a UID's length moves the fold.
+    return response.content.decode().replace("\r\n ", "")
 
 
 @pytest.mark.postgres
-def test_nd_calendar_and_contacts_match_the_content_path(client, db, settings):
+def test_nd_calendar_and_contacts_download_from_the_real_rows(
+    client, db, settings
+):
     # A single-court sync, as on the ND instance: a multi-court sync pools
-    # every court's contacts into the one table the rows path lists.
+    # every court's contacts into the one table the page lists.
     settings.CORPUS_COURT = "north-dakota"
     corpus_sync(strict=True)
     client.get(ND_URL)
@@ -122,24 +104,11 @@ def test_nd_calendar_and_contacts_match_the_content_path(client, db, settings):
         reviewed=True,
     )
 
-    for content_id, block in ND_FILES.items():
-        from_content = _download(client, settings, "content", content_id)
-        from_rows = _download(client, settings, "corpus", block)
-        assert from_rows["Content-Type"] == from_content["Content-Type"]
-        assert f'filename="{block}.' in from_rows["Content-Disposition"]
-        assert (
-            f'filename="{content_id}.' in from_content["Content-Disposition"]
-        )
-        rows_body = _normalized(from_rows, block)
-        assert rows_body == _normalized(from_content, content_id)
-        assert f"UID:{ND_FLOW}-" not in rows_body
-
-    calendar = _normalized(
-        _download(client, settings, "corpus", "calendar"), "calendar"
-    )
+    calendar = _download(client, "calendar")
     assert calendar.count("BEGIN:VEVENT") == 1
-    assert "UID:<flow>-publication_wait@litigantportal.com" in calendar
-    contacts = _normalized(
-        _download(client, settings, "corpus", "contacts"), "contacts"
+    assert (
+        f"UID:{ND_FLOW}-calendar-publication_wait@litigantportal.com"
+        in calendar
     )
+    contacts = _download(client, "contacts")
     assert contacts.count("BEGIN:VCARD") == 5

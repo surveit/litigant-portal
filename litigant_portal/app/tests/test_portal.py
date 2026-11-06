@@ -17,8 +17,10 @@ from django.test import (
 )
 
 from litigant_portal.app.context_processors import toast_messages
+from litigant_portal.app.models import Topic, TopicFlow
 
 User = get_user_model()
+CHAT_APP_NAME = "chatApp"
 
 
 class DjangoSystemTests(SimpleTestCase):
@@ -48,7 +50,31 @@ class HomePageTests(TestCase):
     def test_home_does_not_have_chat_interface(self):
         """Home page should not include the chat Alpine component."""
         response = self.client.get("/")
-        self.assertNotContains(response, "homePage")
+        self.assertNotContains(response, CHAT_APP_NAME)
+
+    def test_topic_cards_open_the_guided_flow_not_the_chat(self):
+        """Cards are the no-AI way in (#1068), so each one opens a guided
+        flow page rather than the chat."""
+        topic = Topic.objects.create(
+            slug="eviction", title="Eviction", court="franklin-county-oh"
+        )
+        TopicFlow.objects.create(
+            topic=topic, slug="tenant", name="Responding", enabled=True
+        )
+        response = self.client.get("/")
+        self.assertEqual(
+            [card["url"] for card in response.context["topic_cards"]],
+            ["/t/franklin-county-oh/eviction/tenant/"],
+        )
+
+    def test_a_topic_without_a_court_gets_no_card(self):
+        """A topic sync has not stamped yet has no page to open."""
+        topic = Topic.objects.create(slug="eviction", title="Eviction")
+        TopicFlow.objects.create(
+            topic=topic, slug="tenant", name="Responding", enabled=True
+        )
+        response = self.client.get("/")
+        self.assertEqual(response.context["topic_cards"], [])
 
 
 @pytest.mark.postgres
@@ -62,7 +88,7 @@ class ChatPageTests(TestCase):
         """Chat page should return 200 with the chat app mounted."""
         response = self.client.get("/chat/")
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "chatApp")
+        self.assertContains(response, CHAT_APP_NAME)
 
 
 # =============================================================================

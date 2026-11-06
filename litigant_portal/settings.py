@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
 
 from litigant_portal.app.features import parse_deployment_env, parse_pilot
@@ -12,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 BEDROCK_API_KEY = os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")
+AWS_REGION = os.environ.get("AWS_REGION", "").strip() or "us-east-1"
+BEDROCK_ALLOWED_GEOGRAPHY = (
+    os.environ.get("BEDROCK_ALLOWED_GEOGRAPHY", "").strip().upper() or "US"
+)
 
 DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
 
@@ -26,15 +29,6 @@ PILOT = parse_pilot(os.environ.get("PILOT"))
 # GitHub account, so pilots get email; dev and QA keep the GitHub link.
 # `or`, not a default: compose passes an unset variable through as blank.
 FEEDBACK_EMAIL = os.environ.get("FEEDBACK_EMAIL") or "LpFeedback@free.law"
-
-# The new agent's development page also requires developer permission. QA
-# exists to test it, so the label turns it on without a second variable.
-LP_AGENT_DEV_ENABLED = (
-    os.environ.get(
-        "LP_AGENT_DEV_ENABLED", "true" if DEPLOYMENT_ENV == "qa" else "false"
-    ).lower()
-    == "true"
-)
 
 # Provenance of the running build, shown in the dev/QA header so testers can
 # tell which deploy they are looking at. All three are baked in at image build
@@ -151,7 +145,10 @@ AUTH_PASSWORD_VALIDATORS = [
         "NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",
     },
     {
+        # NIST SP 800-63B rev 4 sets 15 for a password that's the only
+        # login factor, as it is on the pilots (8 only alongside MFA).
         "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 15},
     },
     {
         "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
@@ -378,18 +375,8 @@ if not DEBUG:
 # and resources (dev) and leaves the site's court fields alone.
 CORPUS_COURT = os.environ.get("CORPUS_COURT") or None
 
-# Which tree builds the guided page at /t/<court>/<topic>/<role>/ (#1016):
-# "content" reads litigant_portal/content/ through the registry, "corpus"
-# reads the TopicFlow rows sync_corpus writes. The default flips in #1018.
-TOPIC_FLOW_SOURCE = os.environ.get("TOPIC_FLOW_SOURCE") or "content"
-if TOPIC_FLOW_SOURCE not in ("content", "corpus"):
-    raise ImproperlyConfigured(
-        f"TOPIC_FLOW_SOURCE must be 'content' or 'corpus', "
-        f"not {TOPIC_FLOW_SOURCE!r}"
-    )
-
 # Audit window: cleanup_sessions keeps chat activity this many days.
-AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "30"))
+AUDIT_RETENTION_DAYS = int(os.environ.get("AUDIT_RETENTION_DAYS", "90"))
 
 # docassemble. Every URL is built from these settings; the corpus contributes
 # only the interview reference (#879). With neither URL set, packet sections

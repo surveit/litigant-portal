@@ -5,7 +5,10 @@ from django.db import transaction
 from django.db.models import Max
 from django.utils.text import slugify
 
-from litigant_portal.app.cache import TOPIC_LIST_CACHE_KEY
+from litigant_portal.app.cache import (
+    TOPIC_FLOW_LIST_CACHE_KEY,
+    TOPIC_LIST_CACHE_KEY,
+)
 from litigant_portal.app.models import Topic, Variable, VariableAnswer
 from litigant_portal.app.models.choices import VariableDataType
 
@@ -21,7 +24,7 @@ def _topic_unique_slug(*, title: str) -> str:
     return slug
 
 
-@busts_cache(TOPIC_LIST_CACHE_KEY)
+@busts_cache(TOPIC_LIST_CACHE_KEY, TOPIC_FLOW_LIST_CACHE_KEY)
 def topic_create(**fields) -> Topic:
     """Create a topic, appended to the display order."""
     last = Topic.objects.aggregate(m=Max("order"))["m"]
@@ -32,7 +35,7 @@ def topic_create(**fields) -> Topic:
     )
 
 
-@busts_cache(TOPIC_LIST_CACHE_KEY)
+@busts_cache(TOPIC_LIST_CACHE_KEY, TOPIC_FLOW_LIST_CACHE_KEY)
 def topic_update(*, topic: Topic, **fields) -> Topic:
     """Update a topic's editable fields."""
     for name, value in fields.items():
@@ -41,7 +44,7 @@ def topic_update(*, topic: Topic, **fields) -> Topic:
     return topic
 
 
-@busts_cache(TOPIC_LIST_CACHE_KEY)
+@busts_cache(TOPIC_LIST_CACHE_KEY, TOPIC_FLOW_LIST_CACHE_KEY)
 def topic_delete(*, topic: Topic) -> None:
     topic.delete()
 
@@ -88,29 +91,52 @@ def variable_value_validate(*, data_type: str, choices: list, value):
     return value
 
 
+@transaction.atomic
 def variable_answer_set(
-    *, identity, variable: Variable, value, reviewed: bool = False
+    *,
+    identity,
+    variable: Variable,
+    value,
+    reviewed: bool = False,
+    evidence: dict[str, str | None] | None = None,
 ) -> VariableAnswer:
-    """Upsert an identity's answer to a variable.
+    """
+    Upsert an identity's answer to a variable.
 
-    Validates against the variable's data_type/choices first — an invalid
-    value writes nothing. ``reviewed`` defaults to False (AI-written); pass
-    True only from the guided fact page after human confirmation. Only
-    reviewed=True answers may reach the docassemble prefill payload, since
-    prefilled variables skip their questions with no further human check.
-    Every unconfirmed write resets reviewed, even one that rewrites the
-    same value. Deliberately conservative: dropping a confirmation only
-    re-asks a question, while carrying a stale one forward would prefill
-    a court form unchecked.
+    Validate first. Unchanged values can gain missing evidence but keep
+    existing evidence and their timestamp; only an explicit human
+    confirmation can update reviewed. Changed values replace evidence and
+    use the caller's reviewed status, defaulting to False for AI writes.
+    Only reviewed answers may reach docassemble prefill.
     """
     value = variable_value_validate(
         data_type=variable.data_type, choices=variable.choices, value=value
     )
-    answer, _ = VariableAnswer.objects.update_or_create(
+    if value is None or not evidence or not evidence.get("quote"):
+        evidence = None
+    answer, created = VariableAnswer.objects.select_for_update().get_or_create(
         identity=identity,
         variable=variable,
-        defaults={"value": value, "reviewed": reviewed},
+        defaults={"value": value, "reviewed": reviewed, "evidence": evidence},
     )
+    if created:
+        return answer
+    if answer.value == value:
+        updated_fields = []
+        if answer.evidence is None and evidence is not None:
+            answer.evidence = evidence
+            updated_fields.append("evidence")
+        if reviewed and not answer.reviewed:
+            answer.reviewed = True
+            updated_fields.append("reviewed")
+        if updated_fields:
+            answer.save(update_fields=updated_fields)
+        return answer
+
+    answer.value = value
+    answer.reviewed = reviewed
+    answer.evidence = evidence
+    answer.save(update_fields=["value", "reviewed", "evidence", "updated_at"])
     return answer
 
 
@@ -143,7 +169,8 @@ def variable_answer_confirm(
 def variable_answer_set_many(
     *, identity, values: dict, reviewed: bool = False
 ) -> int:
-    """Upsert answers keyed by variable name; returns how many were written.
+    """
+    Upsert answers keyed by variable name; return how many were processed.
 
     Raises ``Variable.DoesNotExist`` if a name has no glossary row. That is
     a corpus-sync failure, not litigant input, so it must surface rather

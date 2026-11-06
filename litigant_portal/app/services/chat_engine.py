@@ -3,6 +3,7 @@ import json
 import logging
 from collections.abc import Callable, Iterator
 from dataclasses import asdict
+from time import monotonic
 from typing import Any
 
 import litellm
@@ -15,6 +16,7 @@ from django.utils.translation import gettext as _
 
 from litigant_portal.agents.base import Agent, IdentityPrompt, ToolOutput
 from litigant_portal.agents.citations import citation_ids, citation_ids_unknown
+from litigant_portal.agents.judge import AgentJudge, JudgeVerdict
 from litigant_portal.agents.tools.load_topic_flow import topic_flow_from_path
 from litigant_portal.app.models import (
     ChatMessage,
@@ -22,20 +24,28 @@ from litigant_portal.app.models import (
     PromptArtifact,
     UserIdentity,
 )
+from litigant_portal.app.selectors.bedrock import (
+    bedrock_model_target,
+)
 from litigant_portal.app.selectors.chat_engine import (
     chat_message_list,
     chat_thread_get,
 )
-from litigant_portal.app.selectors.site import site_get_model
+from litigant_portal.app.selectors.site import site_get, site_get_model_target
+from litigant_portal.app.selectors.topic_flow import topic_flow_url_kwargs
+from litigant_portal.app.services.bedrock import (
+    bedrock_catalog_invalidate_on_error,
+)
 from litigant_portal.app.services.upload import (
     user_upload_llm_parts,
     user_upload_render_list,
 )
-from litigant_portal.app.topic_flow.registry import topic_flow_track_find
 
 logger = logging.getLogger(__name__)
 
 MAX_STEPS = 30
+MAX_CORRECTIONS = 2
+HEARTBEAT_INTERVAL_SECONDS = 10
 
 DESCRIPTION_PROMPT = (
     "Write a very short title (at most 6 words) for the following "
@@ -171,7 +181,8 @@ def chat_message_inject_meta(
 
 def chat_thread_generate_description(*, thread: ChatThread) -> str:
     """Generate and store a short description of a thread's conversation."""
-    model = site_get_model(role="fast")
+    target = site_get_model_target(role="fast")
+    model = target.model
     conversation = "\n".join(
         f"{m.data.get('role')}: {m.data.get('content')}"
         for m in chat_message_list(
@@ -181,15 +192,22 @@ def chat_thread_generate_description(*, thread: ChatThread) -> str:
         and m.data.get("content")
     )
     response = litellm.completion(
-        model=model,
+        **target.invocation_options(small_task=True),
+        api_key=settings.BEDROCK_API_KEY,
+        max_tokens=1024,
         messages=[
             {"role": "system", "content": DESCRIPTION_PROMPT},
             {"role": "user", "content": conversation[:4000]},
         ],
     )
     try:
-        cost = litellm.completion_cost(completion_response=response)
-    except Exception:
+        cost = target.completion_cost(response.usage)
+    except Exception as error:
+        logger.warning(
+            "Title cost extraction failed (%s, model=%s)",
+            type(error).__name__,
+            model,
+        )
         cost = 0.0
     usage = getattr(response, "usage", None)
     # Book the call's tokens/cost so chat_thread_usage reflects it.
@@ -201,23 +219,18 @@ def chat_thread_generate_description(*, thread: ChatThread) -> str:
         cost=cost,
     )
     description = (response.choices[0].message.content or "").strip()[:255]
+    finish_reason = getattr(response.choices[0], "finish_reason", None)
+    if not description or finish_reason == "length":
+        logger.warning(
+            "Thread title empty or truncated (thread=%s, model=%s, finish_reason=%s)",
+            thread.id,
+            model,
+            finish_reason,
+        )
     if description:
         thread.description = description
         thread.save(update_fields=["description", "updated_at"])
     return description
-
-
-def _resolve_thread(
-    *, identity: UserIdentity, thread_id: str | None, thread_type: str
-) -> ChatThread:
-    """Return the identity's thread, creating a fresh one when no id is given."""
-    if thread_id:
-        return chat_thread_get(
-            identity=identity, thread_id=thread_id, thread_type=thread_type
-        )
-    return ChatThread.objects.create(
-        identity=identity, thread_type=thread_type
-    )
 
 
 def _sse(payload: dict[str, Any]) -> str:
@@ -274,10 +287,13 @@ def _messages_for_llm(
     history: list[dict[str, Any]],
     *,
     attachment_cache: dict,
+    capabilities: frozenset[str],
 ) -> list[dict[str, Any]]:
     """Prepend the (never-stored) system prompt and project to litellm shape,
     and inject attachment content parts or stubs."""
-    hydrated = user_upload_llm_parts(history=history, cache=attachment_cache)
+    hydrated = user_upload_llm_parts(
+        history=history, cache=attachment_cache, capabilities=capabilities
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt}
     ]
@@ -368,7 +384,10 @@ def chat_thread_render_items(
         elif role == "assistant":
             content = msg.get("content", "")
             if content:
-                items.append({"kind": "assistant", "content": content})
+                item = {"kind": "assistant", "content": content}
+                if msg.get("review_warning"):
+                    item["review_warning"] = True
+                items.append(item)
             for tool_call in msg.get("tool_calls") or []:
                 items.append(_tool_item(tool_call, results, tools))
     return items
@@ -397,16 +416,13 @@ def _stream_error_event(thread: ChatThread) -> dict[str, str]:
     try:
         active_path = (thread.state or {}).get("active_topic_flow")
         flow = (
-            topic_flow_from_path(active_path)
+            topic_flow_from_path(active_path, graph=False)
             if isinstance(active_path, str)
             else None
         )
-        track = topic_flow_track_find(flow) if flow else None
-        if track:
-            guided_url = reverse(
-                "pages:topic_flow",
-                kwargs={key: track[key] for key in ("court", "topic", "role")},
-            )
+        page = topic_flow_url_kwargs(flow) if flow else None
+        if page:
+            guided_url = reverse("pages:topic_flow", kwargs=page)
             guided_label = flow.name
             guided_message = _(
                 "The assistant is temporarily unavailable. You can continue "
@@ -423,21 +439,102 @@ def _stream_error_event(thread: ChatThread) -> dict[str, str]:
     }
 
 
+def _judge_candidate(
+    *, thread: ChatThread, model: str, messages: list[dict], candidate: str
+) -> JudgeVerdict | None:
+    """
+    Audit one review, including usage when a returned verdict cannot parse.
+    """
+    verdict = None
+    cost, num_tokens = 0.0, 0
+    audit: dict[str, Any] = {"role": "meta", "kind": "judge"}
+    error_category = "provider_error"
+    try:
+        target = bedrock_model_target(model=model)
+        model = target.model
+        response = litellm.completion(
+            **target.invocation_options(small_task=True),
+            api_key=settings.BEDROCK_API_KEY,
+            max_tokens=4096,
+            messages=AgentJudge.request(
+                {"messages": messages, "state": thread.state}, candidate
+            ),
+            stream=False,
+            timeout=45,
+            num_retries=0,
+        )
+        error_category = "invalid_output"
+        if response.usage:
+            num_tokens = response.usage.completion_tokens or 0
+        try:
+            cost = target.completion_cost(response.usage)
+        except Exception as error:
+            logger.warning(
+                "Judge cost extraction failed (%s, model=%s)",
+                type(error).__name__,
+                model,
+            )
+        if response.choices:
+            audit["content"] = response.choices[0].message.content or ""
+        verdict = AgentJudge.review(response)
+        audit["verdict"] = verdict.model_dump(mode="json")
+    except Exception as error:
+        bedrock_catalog_invalidate_on_error(error)
+        audit["error"] = "judge_failed"
+        audit["error_category"] = (
+            "timeout"
+            if isinstance(error, (litellm.Timeout, TimeoutError))
+            else error_category
+        )
+        logger.warning(
+            "chat_engine judge failed (%s); "
+            "releasing draft (thread=%s, model=%s)",
+            type(error).__name__,
+            thread.id,
+            model,
+        )
+    # A database failure must reach the stream's error handler, not fail open.
+    chat_message_create(
+        thread_id=thread.id,
+        data=audit,
+        model=model,
+        num_tokens=num_tokens,
+        cost=cost,
+        meta=True,
+    )
+    return verdict
+
+
 def chat_stream(
     *,
     identity: UserIdentity,
     message: str,
     agent_class: type[Agent],
     thread_type: str,
-    model: str,
+    model: str | None = None,
     thread_id: str | None = None,
     attachment_ids: list[str] | None = None,
 ) -> StreamingHttpResponse:
     """Stream an agent's reply for ``message``, running the tool loop."""
-    thread = _resolve_thread(
-        identity=identity, thread_id=thread_id, thread_type=thread_type
+    thread = (
+        chat_thread_get(
+            identity=identity, thread_id=thread_id, thread_type=thread_type
+        )
+        if thread_id
+        else None
     )
     agent = agent_class()
+    required = frozenset(
+        {"text", "stream"} | ({"tools"} if agent.tools else set())
+    )
+    if model:
+        target = bedrock_model_target(model=model, required=required)
+    else:
+        target = site_get_model_target(role="assistant", required=required)
+    model = target.model
+    thread = thread or ChatThread.objects.create(
+        identity=identity, thread_type=thread_type
+    )
 
     if "model" in agent.completion_args:
         raise ValueError(
@@ -469,12 +566,14 @@ def chat_stream(
         attachment_cache: dict = {}
 
         try:
+            judge_model = site_get().judge_model
+            corrections = 0
             system_prompt = agent.generate_system_prompt(thread_id=thread.id)
             identity_prompt = agent.generate_identity_prompt(
                 thread_id=thread.id
             )
 
-            for _ in range(MAX_STEPS):
+            for step in range(MAX_STEPS):
                 tool_schemas = agent.tool_schemas or []
                 prompt_artifact = prompt_artifact_get_or_create(
                     system_prompt=system_prompt,
@@ -482,11 +581,13 @@ def chat_stream(
                 )
                 call_args: dict[str, Any] = {
                     **agent.completion_args,
-                    "model": model,
+                    **target.invocation_options(),
+                    "api_key": settings.BEDROCK_API_KEY,
                     "messages": _messages_for_llm(
                         _system_prompt_text(system_prompt, identity_prompt),
                         history,
                         attachment_cache=attachment_cache,
+                        capabilities=target.capabilities,
                     ),
                     "stream": True,
                     "stream_options": {"include_usage": True},
@@ -499,13 +600,21 @@ def chat_stream(
                 cost = 0.0
                 completion_tokens = None
 
+                if judge_model:
+                    call_args.update(timeout=45, num_retries=0)
+                    last_heartbeat = monotonic()
+                    yield _sse({"type": "heartbeat"})
+
                 for chunk in litellm.completion(**call_args):
+                    if judge_model:
+                        now = monotonic()
+                        if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
+                            last_heartbeat = now
+                            yield _sse({"type": "heartbeat"})
                     usage = getattr(chunk, "usage", None)
                     if usage:
                         try:
-                            cost = litellm.completion_cost(
-                                completion_response=chunk, model=model
-                            )
+                            cost = target.completion_cost(usage)
                             completion_tokens = usage.completion_tokens
                         except Exception:
                             logger.exception(
@@ -518,12 +627,13 @@ def chat_stream(
 
                     if delta.content:
                         content_parts.append(delta.content)
-                        yield _sse(
-                            {
-                                "type": "content_delta",
-                                "content": delta.content,
-                            }
-                        )
+                        if not judge_model:
+                            yield _sse(
+                                {
+                                    "type": "content_delta",
+                                    "content": delta.content,
+                                }
+                            )
 
                     for tc in delta.tool_calls or []:
                         while tc.index >= len(tool_calls):
@@ -558,8 +668,6 @@ def chat_stream(
                 }
                 if tool_calls:
                     assistant_msg["tool_calls"] = tool_calls
-                # Runs after the chips are already on screen; the UI
-                # treatment waits until we know how often this happens.
                 unknown = citation_ids_unknown(
                     assistant_msg["content"],
                     _supplied_citation_ids(system_prompt, history),
@@ -571,16 +679,69 @@ def chat_stream(
                         unknown,
                         thread.id,
                     )
+                verdict = None
+                if judge_model and not tool_calls:
+                    yield _sse({"type": "judging"})
+                    verdict = _judge_candidate(
+                        thread=thread,
+                        model=judge_model,
+                        messages=call_args["messages"],
+                        candidate=assistant_msg["content"],
+                    )
+                rejected = verdict is not None and not verdict.approved
                 history.append(assistant_msg)
+
+                if rejected:
+                    chat_message_create(
+                        thread_id=thread.id,
+                        data=assistant_msg,
+                        model=model,
+                        num_tokens=completion_tokens,
+                        cost=cost,
+                        prompt_artifact=prompt_artifact,
+                        identity_prompt=identity_prompt,
+                        meta=True,
+                    )
+                    if corrections < MAX_CORRECTIONS and step < MAX_STEPS - 1:
+                        corrections += 1
+                        history.append(AgentJudge.correction(verdict))
+                        continue
+                    logger.warning(
+                        "chat_engine judge corrections exhausted; "
+                        "releasing last draft (thread=%s)",
+                        thread.id,
+                    )
+
+                if (
+                    judge_model
+                    and not tool_calls
+                    and (rejected or verdict is None)
+                ):
+                    assistant_msg = {
+                        **assistant_msg,
+                        "review_warning": True,
+                    }
+                # Rejected drafts already own their generation usage in audit rows.
                 chat_message_create(
                     thread_id=thread.id,
                     data=assistant_msg,
                     model=model,
-                    num_tokens=completion_tokens,
-                    cost=cost,
+                    num_tokens=0 if rejected else completion_tokens,
+                    cost=0.0 if rejected else cost,
                     prompt_artifact=prompt_artifact,
                     identity_prompt=identity_prompt,
                 )
+
+                if judge_model and assistant_msg["content"]:
+                    event = {
+                        "type": "content_delta",
+                        "content": assistant_msg["content"],
+                    }
+                    if assistant_msg.get("review_warning"):
+                        event["review_warning"] = assistant_msg[
+                            "review_warning"
+                        ]
+                    yield _sse(event)
 
                 if not tool_calls:
                     break
@@ -658,6 +819,8 @@ def chat_stream(
                 yield _sse({"type": "state", "state": thread.state})
 
                 if refresh:
+                    # A tool stored something: the briefcase panel is stale.
+                    yield _sse({"type": "briefcase_changed"})
                     system_prompt = agent.generate_system_prompt(
                         thread_id=thread.id
                     )
@@ -677,14 +840,16 @@ def chat_stream(
                                 "description": description,
                             }
                         )
-                except Exception:
+                except Exception as error:
+                    bedrock_catalog_invalidate_on_error(error)
                     logger.exception(
                         "chat_engine description generation failed"
                     )
 
             thread.save(update_fields=["updated_at"])
             yield _sse({"type": "done"})
-        except Exception:
+        except Exception as error:
+            bedrock_catalog_invalidate_on_error(error)
             logger.exception("chat_engine stream failed")
             yield _sse(_stream_error_event(thread))
             yield _sse({"type": "done"})

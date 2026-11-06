@@ -35,7 +35,6 @@ services:
       - DEPLOYMENT_ENV=${DEPLOYMENT_ENV:-dev}
       - PILOT=${PILOT:-}
       - FEEDBACK_EMAIL=${FEEDBACK_EMAIL:-}
-      - LP_AGENT_DEV_ENABLED=true
       - SECRET_KEY=dev
       - POSTGRES_HOST=postgres
       - POSTGRES_PASSWORD=postgres
@@ -44,10 +43,11 @@ services:
       # AI Chat configuration
       - SITE_PASSWORD=${SITE_PASSWORD}
       - AWS_BEARER_TOKEN_BEDROCK=${AWS_BEARER_TOKEN_BEDROCK}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - BEDROCK_ALLOWED_GEOGRAPHY=${BEDROCK_ALLOWED_GEOGRAPHY:-US}
       - SUPERUSER_EMAIL=${SUPERUSER_EMAIL}
       - SUPERUSER_PASSWORD=${SUPERUSER_PASSWORD}
       - CORPUS_COURT=${CORPUS_COURT}
-      - TOPIC_FLOW_SOURCE=${TOPIC_FLOW_SOURCE}
       # docassemble prefill. Unset means no prefill: the packet button links
       # out to the plain interview.
       - DOCASSEMBLE_BASE_URL=${DOCASSEMBLE_BASE_URL}
@@ -55,7 +55,6 @@ services:
       - DOCASSEMBLE_PUBLIC_URL=${DOCASSEMBLE_PUBLIC_URL}
     volumes:
       - ./litigant_portal:/app/litigant_portal
-      - ./lp_agent:/app/lp_agent
     stdin_open: true
     tty: true
     depends_on:

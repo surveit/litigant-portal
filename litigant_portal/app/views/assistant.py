@@ -1,11 +1,12 @@
-from django.http import HttpRequest, JsonResponse
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.shortcuts import render
 from django.utils.translation import gettext as _
 from django.views.decorators.http import require_GET, require_POST
 from django_ratelimit.decorators import ratelimit
 
 from litigant_portal.agents import LitigantAssistant
 from litigant_portal.app.models import UserUpload
-from litigant_portal.app.selectors.site import site_get_model
+from litigant_portal.app.models.chat_engine import USER_CHAT_THREAD_TYPE
 from litigant_portal.app.selectors.upload import user_upload_list
 from litigant_portal.app.services.upload import (
     UploadValidationError,
@@ -14,9 +15,7 @@ from litigant_portal.app.services.upload import (
     user_upload_serialize,
 )
 from litigant_portal.app.views import chat_engine
-
-THREAD_TYPE = "user_chat"
-
+from litigant_portal.app.views.utils import briefcase_answers
 
 # General chat endpoints
 
@@ -27,15 +26,14 @@ def stream(request: HttpRequest):
     return chat_engine.stream(
         request,
         agent_class=LitigantAssistant,
-        thread_type=THREAD_TYPE,
-        model=site_get_model(role="assistant"),
+        thread_type=USER_CHAT_THREAD_TYPE,
     )
 
 
 @require_GET
 @ratelimit(key="ip", rate="60/m", method="GET", block=True)
 def thread_list(request: HttpRequest) -> JsonResponse:
-    return chat_engine.thread_list(request, thread_type=THREAD_TYPE)
+    return chat_engine.thread_list(request, thread_type=USER_CHAT_THREAD_TYPE)
 
 
 @require_GET
@@ -45,7 +43,7 @@ def message_list(request: HttpRequest, thread_id) -> JsonResponse:
         request,
         thread_id,
         agent_class=LitigantAssistant,
-        thread_type=THREAD_TYPE,
+        thread_type=USER_CHAT_THREAD_TYPE,
     )
 
 
@@ -55,7 +53,7 @@ def thread_usage(request: HttpRequest, thread_id) -> JsonResponse:
     if not request.user.is_superuser:
         return JsonResponse({"error": _("Forbidden")}, status=403)
     return chat_engine.thread_usage(
-        request, thread_id, thread_type=THREAD_TYPE
+        request, thread_id, thread_type=USER_CHAT_THREAD_TYPE
     )
 
 
@@ -63,11 +61,26 @@ def thread_usage(request: HttpRequest, thread_id) -> JsonResponse:
 @ratelimit(key="ip", rate="30/m", method="POST", block=True)
 def thread_delete(request: HttpRequest, thread_id) -> JsonResponse:
     return chat_engine.thread_delete(
-        request, thread_id, thread_type=THREAD_TYPE
+        request, thread_id, thread_type=USER_CHAT_THREAD_TYPE
     )
 
 
 # Assistant-specific endpoints
+
+
+@require_GET
+@ratelimit(key="ip", rate="60/m", method="GET", block=True)
+def briefcase(request: HttpRequest) -> HttpResponse:
+    """The chat page's briefcase panel alone, swapped in when a tool saves a fact (#941).
+
+    Same component and context as the page's first paint, so a refreshed
+    panel can't drift from a server-rendered one.
+    """
+    return render(
+        request,
+        "pages/chat/partials/_briefcase.html",
+        {"briefcase_groups": briefcase_answers(request)},
+    )
 
 
 @require_GET

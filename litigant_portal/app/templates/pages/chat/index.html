@@ -11,7 +11,7 @@
 {# chatApp spans the whole page: the thread list in the frame's left region, #}
 {# the conversation, and the briefcase in the right region all share its state. #}
 {# The component is agent-agnostic: point it at any agent's API mount. #}
-{% block body_attrs %}x-data="chatApp" data-agent-base="/api/agents/assistant/" data-citation-chips="{{ features.citation_chips|yesno:'true,false' }}"{% endblock body_attrs %}
+{% block body_attrs %}x-data="chatApp" data-agent-base="/api/agents/assistant/" data-briefcase-url="{% url 'pages:briefcase' %}" data-citation-chips="{{ features.citation_chips|yesno:'true,false' }}" data-review-warning="{% trans "Warning: This answer could not be fully verified and may contain errors." %}"{% endblock body_attrs %}
 
 {% block frame_left %}
   {% include "pages/chat/partials/_thread_list.html" %}
@@ -42,13 +42,6 @@
                x-transition
                class="absolute left-0 top-full mt-1 w-44 bg-white rounded-lg shadow-lg border border-greyscale-200 py-1 z-50"
                role="menu">
-            <button type="button"
-                    role="menuitem"
-                    class="flex items-center gap-2.5 w-full px-3 py-2 text-sm text-greyscale-700 hover:bg-greyscale-100 cursor-pointer">
-              <c-atoms.icon name="share" class="w-4 h-4 text-greyscale-500" />
-              {% trans "Share" %}
-            </button>
-            <div class="my-1 border-t border-greyscale-200"></div>
             <button type="button"
                     role="menuitem"
                     x-on:click="deleteThread"
@@ -130,6 +123,12 @@
             </template>
           </div>
           {# Text part — user / assistant bubble #}
+          <c-atoms.alert variant="warning"
+                         role=""
+                         x-show="message.reviewWarning"
+                         x-cloak
+                         x-text="reviewWarningText"
+                         class="mb-2 max-w-[80%]" />
           <div x-show="message.notTool"
                class="max-w-[80%] rounded-lg px-3 py-2 text-sm break-words"
                x-bind:class="message.bubbleClass">
@@ -163,6 +162,7 @@
             <span class="typing-dot"></span>
             <span class="typing-dot"></span>
           </div>
+          <span x-show="checkingVisible" class="text-sm">{% trans "Checking this against your court's information..." %}</span>
         </div>
       </div>
       <div x-show="conversationEmpty"
@@ -173,8 +173,8 @@
     </div>
     {# Input #}
     <div class="border-t border-greyscale-200 p-3 flex-shrink-0">
-      {% if perms.app.manage_developers %}
-        {# Dev-only token/cost readout for the active thread #}
+      {% if perms.app.manage_site %}
+        {# FLP Staff token/cost readout for the active thread #}
         <div x-data="chatUsage"
              x-cloak
              class="flex items-center gap-1.5 mb-2 text-xs text-greyscale-500 select-none">

@@ -11,10 +11,8 @@ from litigant_portal.app.views import (
     admin as admin_views,
 )
 from litigant_portal.app.views import (
-    agent as agent_views,
-)
-from litigant_portal.app.views import (
     assistant,
+    design_system,
     health,
     pages,
 )
@@ -25,15 +23,10 @@ from litigant_portal.app.views import (
 app_patterns = [
     path("", pages.home, name="home"),
     path("chat/", pages.chat_view, name="chat"),
-    path("dev/agent/", agent_views.development_page, name="agent_development"),
-    path(
-        "dev/agent/stream/",
-        agent_views.development_stream,
-        name="agent_development_stream",
-    ),
+    path("chat/briefcase/", assistant.briefcase, name="briefcase"),
     path(
         "t/<slug:court>/<slug:topic>/<slug:role>/",
-        pages.topic_flow,
+        topic_flow_views.topic_flow,
         name="topic_flow",
     ),
     path(
@@ -61,20 +54,20 @@ app_patterns = [
     path("privacy/", pages.privacy, name="privacy"),
     path("help/", pages.get_help, name="help"),
     path("accessibility/", pages.accessibility, name="accessibility"),
-    path("style-guide/", pages.style_guide, name="style_guide"),
+    path("style-guide/", design_system.style_guide, name="style_guide"),
     path(
         "style-guide/atomic-design/",
-        pages.atomic_design,
+        design_system.atomic_design,
         name="atomic_design",
     ),
     path(
         "style-guide/accessibility/",
-        pages.a11y_guide,
+        design_system.a11y_guide,
         name="a11y_guide",
     ),
     path(
         "style-guide/atomic-design/<slug:stage>/",
-        pages.atomic_design_stage,
+        design_system.atomic_design_stage,
         name="atomic_design_stage",
     ),
 ]
@@ -156,19 +149,9 @@ admin_api_patterns = [
         name="user_delete",
     ),
     path(
-        "users/<int:user_id>/user-admin/toggle/",
-        admin_views.user_user_admin_toggle_view,
-        name="user_user_admin_toggle",
-    ),
-    path(
-        "users/<int:user_id>/admin/toggle/",
-        admin_views.user_admin_toggle_view,
-        name="user_admin_toggle",
-    ),
-    path(
-        "users/<int:user_id>/developer/toggle/",
-        admin_views.user_developer_toggle_view,
-        name="user_developer_toggle",
+        "users/<int:user_id>/role/",
+        admin_views.user_role_view,
+        name="user_role",
     ),
 ]
 
