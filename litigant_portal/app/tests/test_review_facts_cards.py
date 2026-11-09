@@ -31,9 +31,16 @@ FACTS = [
         "name": "first_name",
         "label": "First name",
         "value": "Sandra",
+        "display_value": "Sandra",
         "reviewed": True,
     },
-    {"name": "county", "label": "County", "value": "Cass", "reviewed": False},
+    {
+        "name": "county",
+        "label": "County",
+        "value": "Cass",
+        "display_value": "Cass",
+        "reviewed": False,
+    },
 ]
 TRACK = {"court": "test-court", "topic": "name-change", "role": "standard"}
 AS_OF = "2026-09-29T12:00:00.000000+00:00"
