@@ -237,7 +237,6 @@ def generate_topic_flows_prompt() -> str:
 def _fact_values(answers) -> dict[str, str]:
     """Variable name -> its values exactly as the facts section renders them.
 
-    One entry per variable, so redacting by name removes both values.
     json.dumps: a value with a newline must not add its own prompt lines.
     """
     return {

@@ -5,7 +5,7 @@ from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import formats
 from django.utils.dateparse import parse_date, parse_datetime
-from django.utils.translation import gettext as _
+from django.utils.translation import gettext_lazy as _
 
 from litigant_portal.app.formatting import format_long_date
 
@@ -186,7 +186,7 @@ class VariableAnswer(BaseModel):
         `2026-09-09`, so the shaping lives here rather than in the template.
         """
         if isinstance(self.value, bool):
-            return _("Yes") if self.value else _("No")
+            return str(_("Yes")) if self.value else str(_("No"))
         if isinstance(self.value, list):
             return ", ".join(str(item) for item in self.value)
         if self.value is None:

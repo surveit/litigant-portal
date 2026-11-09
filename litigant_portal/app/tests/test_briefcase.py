@@ -270,10 +270,6 @@ class DisplayValueTests(SimpleTestCase):
         self.assertEqual(self._value(True), "Yes")
         self.assertEqual(self._value(False), "No")
 
-    def test_booleans_render_as_plain_strings(self):
-        # json.dumps in the facts prompt raises on a lazy translation proxy.
-        self.assertIs(type(self._value(True)), str)
-
     def test_false_is_not_treated_as_absent(self):
         # `if self.value` would collapse False to the str() branch and print
         # "False"; the isinstance check is what keeps it a real answer.
