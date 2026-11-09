@@ -21,7 +21,9 @@ class RecordFact(Tool):
     facts: dict[str, Any] = Field(
         description=(
             "Mapping of variable name to value, e.g. "
-            '{"county": "Burleigh", "date_of_birth": "1990-01-31"}'
+            '{"county": "Burleigh", "date_of_birth": "1990-01-31"}. '
+            "To re-save a listed fact, pass its `value`, not its "
+            "`display_value`."
         )
     )
     evidence: dict[str, dict[str, str | None]] = Field(
@@ -109,8 +111,7 @@ class RecordFact(Tool):
                     {
                         "name": name,
                         "label": variable.label or name,
-                        "value": answer.value,
-                        "display_value": str(answer.display_value),
+                        "value": str(answer.display_value),
                     }
                 )
                 continue
@@ -118,9 +119,8 @@ class RecordFact(Tool):
                 {
                     "name": name,
                     "label": variable.label or name,
-                    "value": answer.value,
                     # str(): lazy translation proxies break JSON encoding.
-                    "display_value": str(answer.display_value),
+                    "value": str(answer.display_value),
                     "cleared": value is None,
                 }
             )

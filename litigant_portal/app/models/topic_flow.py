@@ -5,7 +5,7 @@ from django.core.validators import RegexValidator
 from django.db import models
 from django.utils import formats
 from django.utils.dateparse import parse_date, parse_datetime
-from django.utils.translation import gettext_lazy as _
+from django.utils.translation import gettext as _
 
 from litigant_portal.app.formatting import format_long_date
 

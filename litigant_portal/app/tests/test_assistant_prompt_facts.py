@@ -64,6 +64,19 @@ def test_answers_listed_with_confirmed_and_unconfirmed_markers(
     )
 
 
+def test_a_boolean_fact_lists_its_stored_value_and_its_word(identity, thread):
+    is_adult = Variable.objects.create(
+        name="is_adult",
+        label="18 or older",
+        data_type=VariableDataType.BOOLEAN,
+    )
+    variable_answer_set(identity=identity, variable=is_adult, value=True)
+
+    prompt = _identity_prompt(thread).text
+
+    assert '- is_adult (18 or older): value: true, display_value: "Yes"' in prompt
+
+
 def test_a_choice_fact_lists_its_stored_value_and_its_label(identity, thread):
     citizenship = Variable.objects.create(
         name="citizenship",
