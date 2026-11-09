@@ -109,7 +109,8 @@ class RecordFact(Tool):
                     {
                         "name": name,
                         "label": variable.label or name,
-                        "value": str(answer.display_value),
+                        "value": answer.value,
+                        "display_value": str(answer.display_value),
                     }
                 )
                 continue
@@ -117,8 +118,9 @@ class RecordFact(Tool):
                 {
                     "name": name,
                     "label": variable.label or name,
+                    "value": answer.value,
                     # str(): lazy translation proxies break JSON encoding.
-                    "value": str(answer.display_value),
+                    "display_value": str(answer.display_value),
                     "cleared": value is None,
                 }
             )

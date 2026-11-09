@@ -123,7 +123,9 @@ user. Unconfirmed facts are the user's own statements awaiting their \
 review: treat them as what the user told you, and when the user corrects \
 one, save the new value with RecordFact. If a listed fact may not apply \
 to the current matter, confirm it rather than re-ask it from scratch. \
-Never invent a fact that is not listed here or stated by the user.
+Never invent a fact that is not listed here or stated by the user. Each \
+fact lists `value`, the stored form to pass to RecordFact, and \
+`display_value`, the wording to use with the user.
 
 {facts}"""
 
@@ -235,12 +237,17 @@ def generate_topic_flows_prompt() -> str:
 
 
 def _fact_values(answers) -> dict[str, str]:
-    """Variable name -> the value exactly as the facts section renders it.
+    """Variable name -> its values exactly as the facts section renders them.
 
+    One entry per variable, so redacting by name removes both values.
     json.dumps: a value with a newline must not add its own prompt lines.
     """
     return {
-        a.variable.name: json.dumps(str(a.display_value), ensure_ascii=False)
+        a.variable.name: (
+            f"value: {json.dumps(a.value, ensure_ascii=False)}, "
+            "display_value: "
+            f"{json.dumps(str(a.display_value), ensure_ascii=False)}"
+        )
         for a in answers
     }
 

@@ -6,6 +6,7 @@ reviewed=True, and nothing a bad fact does can block its valid siblings.
 """
 
 import pytest
+from django.template.loader import render_to_string
 from django.utils import timezone
 
 from litigant_portal.agents.tools.record_fact import RecordFact
@@ -205,6 +206,74 @@ def test_clearing_a_confirmed_answer_drops_its_confirmation(thread, county):
     assert output.render_data["saved"][0]["cleared"] is True
 
 
+def test_a_saved_choice_carries_its_stored_value_and_its_label(thread, county):
+    output = RecordFact(facts={"county": "burleigh"})(thread_id=thread.id)
+
+    fact = output.render_data["saved"][0]
+    assert fact["value"] == "burleigh"
+    assert fact["display_value"] == "Burleigh County"
+
+
+def test_card_shows_the_display_value_not_the_stored_value():
+    html = render_to_string(
+        "tools/record_fact_result.html",
+        {
+            "data": {
+                "unchanged": [
+                    {
+                        "name": "county",
+                        "label": "County",
+                        "value": "burleigh",
+                        "display_value": "Burleigh County",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert "Burleigh County" in html
+    assert "burleigh" not in html
+
+
+def test_card_saved_before_display_value_existed_still_shows_its_text():
+    html = render_to_string(
+        "tools/record_fact_result.html",
+        {
+            "data": {
+                "unchanged": [
+                    {
+                        "name": "county",
+                        "label": "County",
+                        "value": "Burleigh County",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert "Burleigh County" in html
+
+
+def test_card_for_an_already_cleared_answer_prints_no_none():
+    html = render_to_string(
+        "tools/record_fact_result.html",
+        {
+            "data": {
+                "unchanged": [
+                    {
+                        "name": "county",
+                        "label": "County",
+                        "value": None,
+                        "display_value": "",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert "None" not in html
+
+
 def test_clearing_an_already_cleared_answer_is_unchanged(thread, county):
     variable_answer_set(identity=thread.identity, variable=county, value=None)
 
@@ -247,14 +316,20 @@ def test_unchanged_facts_carry_label_and_display_value(thread, date_of_birth):
 
     unchanged = output.render_data["unchanged"]
     # Same lazy-proxy trap as saved rows: pin the type, not just the value.
-    assert all(type(fact["value"]) is str for fact in unchanged)
+    assert all(type(fact["display_value"]) is str for fact in unchanged)
     assert unchanged == [
         {
             "name": "date_of_birth",
             "label": "Date of birth",
-            "value": "Thursday, January 31, 1991",
+            "value": "1991-01-31",
+            "display_value": "Thursday, January 31, 1991",
         },
-        {"name": "is_adult", "label": "18 or older", "value": "Yes"},
+        {
+            "name": "is_adult",
+            "label": "18 or older",
+            "value": True,
+            "display_value": "Yes",
+        },
     ]
 
 
@@ -377,11 +452,12 @@ def test_render_data_carries_plain_strings_and_labels(thread):
     # display_value for booleans is a lazy translation proxy that compares
     # equal to its str; the engine's JSON serialization needs a real str,
     # so pin the type, not just the value.
-    assert type(fact["value"]) is str
+    assert type(fact["display_value"]) is str
     assert fact == {
         "name": "is_adult",
         "label": "18 or older",
-        "value": "Yes",
+        "value": True,
+        "display_value": "Yes",
         "cleared": False,
     }
     assert output.render_data["errors"] == [
