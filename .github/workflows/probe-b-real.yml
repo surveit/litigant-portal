@@ -7,3 +7,5 @@ jobs:
     uses: ./.github/workflows/smoke.yml
     with:
       image: freelawproject/litigant-portal:071d4b2-prod
+    secrets:
+      AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
