@@ -1,0 +1,9 @@
+name: 'Probe B: smoke against 071d4b2-prod'
+on:
+  push:
+    branches: [1170-gate-probe]
+jobs:
+  smoke:
+    uses: ./.github/workflows/smoke.yml
+    with:
+      image: freelawproject/litigant-portal:071d4b2-prod

@@ -1,0 +1,225 @@
+name: 'Probe D: deploy.yml verbatim except name'
+
+# Builds and publishes the portal image, then deploys it to the `litigant`
+# namespace on the EKS cluster.
+#
+# The action enforces the following order:
+#   tests -> build & publish -> smoke -> deploy
+#
+# The test suite is invoked as a reusable workflow so each stage depends on
+# the previous one, preventing failed tests from reaching production.
+#
+# Smoke loads key pages of the image just published in a browser, so a page
+# that breaks only at render or asset-load time stops the deploy.
+#
+# Migrations are applied in a temporary pod before the web deployment is
+# updated. This catches migration failures before any production pods are
+# replaced. The web entrypoint runs `migrate` again during startup, making it a
+# no-op after a successful deployment.
+#
+# That temp pod is reaped at the start of each deploy rather than at the end of
+# a failed one: a failure leaves the pod up so it can be inspected, and a bare
+# pod has no TTL of its own to clean it up later.
+#
+# Escape hatches:
+# - `skip-deploy` PR label: run tests only; skip publishing and deployment.
+# - `skip-web-deploy` PR label: publish the image and run migrations, but leave
+#   the web deployment on its current image.
+# - A manual run with `skip_playwright_tests`: deploy without the smoke stage.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip_playwright_tests:
+        description: Deploy without running the smoke suite
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-west-2
+  EKS_CLUSTER_NAME: courtlistener
+  EKS_NAMESPACE: litigant
+
+# github-script lists the PR associated with the merge commit; that needs
+# pull-requests: read. contents: read is for checkout.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Serialize publishes so back-to-back merges push image tags in order.
+concurrency:
+  group: litigant-prod-deploy
+  cancel-in-progress: false
+
+jobs:
+  # Runs even when the publish is labelled off. `build` needs it, so a red
+  # suite stops the publish.
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  get-pr-labels:
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.find_pr.outputs.labels }}
+    steps:
+      - name: Find merged PR for this commit
+        id: find_pr
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const commitSha = context.sha;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "closed",
+              sort: "updated",
+              direction: "desc",
+              per_page: 1
+            });
+
+            const pr = prs.find(p => p.merge_commit_sha === commitSha);
+            if (!pr) {
+              core.setOutput("labels", "");
+              core.warning("No merged PR found for this commit.");
+              return;
+            }
+
+            const labels = pr.labels.map(l => l.name);
+            core.setOutput("labels", labels.join(","));
+            console.log(`PR #${pr.number} labels: ${labels.join(", ")}`);
+
+  build:
+    needs: [tests, get-pr-labels]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.get-pr-labels.outputs.labels, 'skip-deploy') }}
+    outputs:
+      sha_short: ${{ steps.vars.outputs.sha_short }}
+    steps:
+      # A manual run builds and deploys whatever ref it was started on.
+      - name: Require main
+        if: ${{ github.ref != 'refs/heads/main' }}
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Manual deploys run only from main; this run is on $REF."
+          exit 1
+      - uses: actions/checkout@v7.0.1
+      - name: Set shortcode
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Build and Push
+        run: make push-image -e VERSION=${{ steps.vars.outputs.sha_short }} -e GIT_BRANCH="${{ github.ref_name }}" -e BUILD_TIME="$(date -u +'%Y/%m/%d %H:%M')"
+
+  # On push events `inputs` is empty, so smoke runs.
+  smoke:
+    needs: build
+    if: ${{ !inputs.skip_playwright_tests }}
+    uses: ./.github/workflows/smoke.yml
+    with:
+      image: freelawproject/litigant-portal:${{ needs.build.outputs.sha_short }}-prod
+
+  setup-deploy:
+    needs: [get-pr-labels, build, smoke]
+    runs-on: ubuntu-latest
+    # By default a skipped dependency skips this job, and a skipped smoke is
+    # the manual override.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.smoke.result == 'success' || needs.smoke.result == 'skipped') }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Create Kubeconfig with AWS CLI
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+      # Force the ExternalSecret to re-sync so the litigant-env Secret is current
+      # before the temp-pod (and the web pod) read it via envFrom.
+      - name: Update Environment Variables
+        env:
+          LITIGANT_ENV: litigant-env
+        run: kubectl annotate es $LITIGANT_ENV force-sync=$(date +%s) --overwrite -n ${{ env.EKS_NAMESPACE }} && kubectl wait es -n ${{ env.EKS_NAMESPACE }} --for=jsonpath="{.status.conditions[?(@.reason=='SecretSynced')].status}"=True --timeout=30s $LITIGANT_ENV
+
+      # Reap temp pods left behind by earlier deploys. A failed deploy keeps its
+      # pod on purpose (the migration handler below tells you to shell into it),
+      # and nothing in Kubernetes reaps a bare pod for us. Without this
+      # sweep, re-running a failed deploy dies on AlreadyExists for the same
+      # temp-pod-<sha>, and pods from older failures accumulate in the
+      # namespace. Sweeping by label is safe because the concurrency group means
+      # no other deploy is in flight.
+      - name: Reap Stale Temporary Pods
+        run: kubectl delete pod -n ${{ env.EKS_NAMESPACE }} -l app=litigant-deploy-temp --ignore-not-found --timeout=60s
+
+      # Sleep-only override bypasses the entrypoint so we control migrate/collectstatic.
+      - name: Launch Temporary Pod
+        run: |
+          kubectl run temp-pod-${{ needs.build.outputs.sha_short }} -n ${{ env.EKS_NAMESPACE }} --labels=app=litigant-deploy-temp --image=freelawproject/litigant-portal:${{ needs.build.outputs.sha_short }}-prod --restart Never --pod-running-timeout=120s --overrides='
+          {
+              "spec": {
+              "containers": [{
+                  "name": "temp-pod",
+                  "image": "freelawproject/litigant-portal:${{ needs.build.outputs.sha_short }}-prod",
+                  "command": ["/bin/sh", "-c", "trap : TERM INT; sleep 3600 & wait"],
+                  "envFrom": [{
+                  "secretRef": {
+                      "name": "litigant-env"
+                  }
+                  }]
+              }]
+              }
+          }'
+      - name: Wait for Temporary Pod to Start
+        run: kubectl wait pods -n ${{ env.EKS_NAMESPACE }} --for condition=Ready --timeout=90s temp-pod-${{ needs.build.outputs.sha_short }}
+
+      - name: Collect Static Assets
+        run: kubectl exec -n ${{ env.EKS_NAMESPACE }} temp-pod-${{ needs.build.outputs.sha_short }} -- manage collectstatic --noinput --clear
+      - name: Handle Collectstatic Error
+        if: failure()
+        run: |
+          echo "collectstatic failed--aborting deploy"
+          exit 1
+
+      - name: Apply Migrations
+        run: kubectl exec -n ${{ env.EKS_NAMESPACE }} temp-pod-${{ needs.build.outputs.sha_short }} -- manage migrate --noinput
+      - name: Handle Migration Error
+        if: failure()
+        run: |
+          echo "Migrations failed. Open a shell into pod temp-pod-${{ needs.build.outputs.sha_short }} to investigate."
+          echo "It stops running after an hour but is kept around for debugging; the next deploy reaps it."
+          exit 1
+
+      # No `if:` here on purpose: when an earlier step fails this is skipped, so
+      # the pod survives for the debugging the handler above points at. The reap
+      # step at the top of the next deploy is what cleans it up.
+      - name: Delete Temporary Pod
+        run: kubectl delete pod -n ${{ env.EKS_NAMESPACE }} temp-pod-${{ needs.build.outputs.sha_short }}
+
+  deploy-web:
+    needs: [get-pr-labels, build, setup-deploy]
+    runs-on: ubuntu-latest
+    # By default a skipped job anywhere upstream skips this one, so a skipped
+    # smoke would block the override without the explicit setup-deploy check.
+    if: ${{ !cancelled() && needs.setup-deploy.result == 'success' && !contains(needs.get-pr-labels.outputs.labels, 'skip-web-deploy') }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Create Kubeconfig with AWS CLI
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Rollout litigant-web
+        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/litigant-web web=freelawproject/litigant-portal:${{ needs.build.outputs.sha_short }}-prod
+      - name: Watch litigant-web rollout status
+        run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/litigant-web

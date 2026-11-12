@@ -1,0 +1,9 @@
+name: 'Probe C: smoke with CORPUS_COURT=north-dakota'
+on:
+  push:
+    branches: [1170-gate-probe]
+jobs:
+  smoke:
+    uses: ./.github/workflows/probe-c-smoke-copy.yml
+    with:
+      image: freelawproject/litigant-portal:071d4b2-prod

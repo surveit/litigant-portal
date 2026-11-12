@@ -1,0 +1,17 @@
+name: Probe stub
+on:
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        default: ''
+      fail:
+        type: boolean
+        default: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "image=${{ inputs.image }} fail=${{ inputs.fail }}"
+      - if: ${{ inputs.fail }}
+        run: exit 1
