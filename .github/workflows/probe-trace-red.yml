@@ -1,0 +1,9 @@
+name: Probe traces (red)
+on:
+  push:
+    branches: [1170-trace-probe]
+jobs:
+  smoke:
+    uses: ./.github/workflows/probe-smoke-nd.yml
+    with:
+      image: freelawproject/litigant-portal:071d4b2-prod
