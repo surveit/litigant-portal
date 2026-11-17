@@ -59,19 +59,9 @@ jobs:
           ALLOWED_HOSTS=localhost,127.0.0.1
           EOF
 
-      - name: Migrate and sync corpus
-        run: |
-          docker run --rm --network host --env-file "$RUNNER_TEMP/app.env" "$IMAGE" manage migrate --noinput
-          docker run --rm --network host --env-file "$RUNNER_TEMP/app.env" "$IMAGE" manage sync_corpus --strict
-
-      # compilemessages runs in the serving container because the .mo files it
-      # writes live there. Prod's entrypoint runs it on every start, and nothing
-      # else in CI does, so a .po that fails to compile is caught here.
       - name: Start app
         id: start
-        run: |
-          docker run --detach --name app --network host --env-file "$RUNNER_TEMP/app.env" "$IMAGE" \
-            bash -c 'manage compilemessages && exec manage runserver 0.0.0.0:8000 --noreload'
+        run: docker run --detach --name app --network host --env-file "$RUNNER_TEMP/app.env" "$IMAGE" web-dev
 
       - name: Wait for /api/health/
         run: |
@@ -115,6 +105,14 @@ jobs:
           URL: ${{ steps.traces.outputs.artifact-url }}
         run: |
           echo "Playwright traces: download [$NAME]($URL), unzip it, and open a trace.zip with \`env -u VIRTUAL_ENV uv run --project scripts/smoke --locked playwright show-trace <trace.zip>\` or at https://trace.playwright.dev" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe web-dev
+        if: ${{ !cancelled() && steps.start.outcome == 'success' }}
+        run: |
+          echo "== processes"; docker top app -o pid,ppid,etime,args
+          echo "== CSS served"; curl -s http://localhost:8000/static/css/main.built.css | wc -c
+          echo "== CSS baked into the image"; docker run --rm "$IMAGE" wc -c /app/litigant_portal/app/static/css/main.built.css
+          echo "== app log"; docker logs app 2>&1 | head -120
 
       - name: App logs
         if: ${{ failure() && steps.start.outcome == 'success' }}

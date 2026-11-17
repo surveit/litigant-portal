@@ -1,0 +1,9 @@
+name: Probe web-dev
+on:
+  push:
+    branches: [1170-webdev-probe]
+jobs:
+  smoke:
+    uses: ./.github/workflows/smoke.yml
+    with:
+      image: freelawproject/litigant-portal:b20fec4-prod
