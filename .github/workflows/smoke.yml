@@ -101,6 +101,8 @@ jobs:
 
       - name: Run smoke suite
         id: suite
+        env:
+          PYTEST_ADDOPTS: --durations=0
         run: make smoke BASE_URL=http://localhost:8000
 
       # Artifact names cannot contain the image reference's ':' or '/'.
@@ -126,6 +128,10 @@ jobs:
           URL: ${{ steps.traces.outputs.artifact-url }}
         run: |
           echo "Playwright traces: download [$NAME]($URL), unzip it, and open a trace.zip with \`env -u VIRTUAL_ENV uv run --project scripts/smoke --locked playwright show-trace <trace.zip>\` or at https://trace.playwright.dev" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe app log
+        if: ${{ !cancelled() && steps.start.outcome == 'success' }}
+        run: docker logs app 2>&1 | grep -v "GET /static/" | tail -60
 
       - name: App logs
         if: ${{ failure() && steps.start.outcome == 'success' }}

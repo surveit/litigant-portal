@@ -1,0 +1,11 @@
+name: Probe chat (b)
+on:
+  push:
+    branches: [1170-chat-probe]
+jobs:
+  smoke:
+    uses: ./.github/workflows/smoke.yml
+    with:
+      image: freelawproject/litigant-portal:b20fec4-prod
+    secrets:
+      AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
