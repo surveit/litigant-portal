@@ -96,6 +96,10 @@ jobs:
             sleep 2
           done
 
+      - name: Probe Bedrock discovery calls
+        if: ${{ !cancelled() }}
+        run: docker exec app manage shell -v 0 -c "$(cat scripts/probe_bedrock.py)"
+
       - name: Install Chromium
         run: uv run --project scripts/smoke --locked playwright install --with-deps chromium
 
